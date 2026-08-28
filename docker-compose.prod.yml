@@ -1,0 +1,33 @@
+# Разворачивание из registry: на сервере ничего не собирается.
+#
+#   IMAGE_TAG=<тег> docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+#   IMAGE_TAG=<тег> docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Секреты сюда не попадают: они приходят из .env рядом с compose-файлом.
+
+services:
+  gateway:
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-gateway:${IMAGE_TAG:-latest}
+    build: !reset null
+    environment:
+      REQUIRE_SIGNATURE: "true"
+      LOG_FORMAT: json
+      LOG_LEVEL: INFO
+
+  worker:
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-worker:${IMAGE_TAG:-latest}
+    build: !reset null
+    environment:
+      LOG_FORMAT: json
+      LOG_LEVEL: INFO
+
+  bot:
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-bot:${IMAGE_TAG:-latest}
+    build: !reset null
+    environment:
+      LOG_FORMAT: json
+      LOG_LEVEL: INFO
+
+  clamd:
+    # На x86-хосте эмуляция не нужна.
+    platform: !reset null

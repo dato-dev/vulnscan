@@ -1,0 +1,179 @@
+name: vulnscantg
+
+services:
+  gateway:
+    networks: [backend, egress]
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    environment:
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      REQUIRE_SIGNATURE: "false"
+      DEFAULT_SHADOW_MODE: ${DEFAULT_SHADOW_MODE:-false}
+      POLICY_FILE: /app/policies.json
+      WEIGHTS_FILE: /app/weights.json
+      LOG_FORMAT: console
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./policies.example.json:/app/policies.json:ro
+      - ./weights.example.json:/app/weights.json:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+
+  worker:
+    networks: [backend]
+    # Ядерная изоляция разбора недоверенных файлов. `runsc` — это gVisor:
+    # системные вызовы обслуживает пользовательское ядро, а не хостовое, и
+    # побег из парсера упирается в него, а не в ядро сервера.
+    # Требует установки (deploy/install-gvisor.sh) и стоит латентности.
+    runtime: ${WORKER_RUNTIME:-runc}
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      CLAMD_HOST: clamd
+      WORK_DIR: /dev/shm/vulnscan
+      DEFAULT_SHADOW_MODE: ${DEFAULT_SHADOW_MODE:-false}
+      POLICY_FILE: /app/policies.json
+      WEIGHTS_FILE: /app/weights.json
+      LOG_FORMAT: console
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./policies.example.json:/app/policies.json:ro
+      - ./weights.example.json:/app/weights.json:ro
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      clamd: {condition: service_healthy}
+    # Периметр разбора недоверенного контента.
+    read_only: true
+    tmpfs:
+      - /dev/shm:size=512m,mode=1777
+      - /tmp:size=64m
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      replicas: 2
+      resources:
+        limits: {cpus: "2", memory: 2g}
+
+  deepscan:
+    networks: [backend]
+    runtime: ${WORKER_RUNTIME:-runc}
+    build:
+      context: .
+      dockerfile: services/worker/Dockerfile
+    environment:
+      PYTHONPATH: /app
+      WORKER_MODE: deep
+      CONSUMER_NAME: deep-1
+      CONCURRENCY: 1
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      CLAMD_HOST: clamd
+      WORK_DIR: /dev/shm/vulnscan
+      POLICY_FILE: /app/policies.json
+      WEIGHTS_FILE: /app/weights.json
+      LOG_FORMAT: console
+      LOG_LEVEL: DEBUG
+    volumes:
+      - ./policies.example.json:/app/policies.json:ro
+      - ./weights.example.json:/app/weights.json:ro
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      clamd: {condition: service_healthy}
+    read_only: true
+    tmpfs:
+      - /dev/shm:size=1g,mode=1777
+      - /tmp:size=64m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+
+  bot:
+    networks: [backend, egress]
+    build:
+      context: .
+      dockerfile: services/bot/Dockerfile
+    environment:
+      PYTHONPATH: /app
+      SCANNER_URL: http://gateway:8080
+      TELEGRAM_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TENANT: telegram-bot
+      LOG_FORMAT: console
+      LOG_LEVEL: INFO
+    depends_on:
+      - gateway
+    restart: unless-stopped
+    # Без токена контейнер поднимется, напишет об этом в лог и завершится.
+    profiles: ["bot"]
+
+  clamd:
+    networks: [backend, egress]
+    image: clamav/clamav:1.4
+    # Официальный образ публикуется только под amd64. На Apple Silicon он идёт
+    # через эмуляцию — медленнее, но для локальной разработки достаточно;
+    # на прод-хосте amd64 это нативный запуск.
+    platform: linux/amd64
+    environment:
+      CLAMAV_NO_FRESHCLAMD: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping 1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    volumes:
+      - clamav-db:/var/lib/clamav
+
+  redis:
+    networks: [backend]
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    networks: [backend]
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - minio-data:/data
+
+networks:
+  # Сеть без выхода наружу. Здесь живёт то, что не должно иметь связи с
+  # внешним миром: воркер, разбирающий недоверенные файлы, и хранилища.
+  backend:
+    internal: true
+
+  # Для тех, кому связь нужна по назначению: gateway принимает запросы
+  # снаружи, clamd тянет сигнатурные базы, бот ходит в Telegram.
+  # Воркера здесь нет — в этом весь смысл.
+  egress: {}
+
+volumes:
+  clamav-db:
+  minio-data:

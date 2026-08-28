@@ -1,0 +1,31 @@
+# Минимальная конфигурация Prometheus для сервиса.
+#
+# Все цели живут во внутренней сети: наружу метрики не публикуются.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /vsconfig/alerts.yml
+
+# Отдача в общий стек. Сервисы к нему не подключаются: он не дотянется во
+# внутреннюю сеть, а выводить их наружу ради метрик — терять изоляцию.
+# Пусто — работаем автономно, данные живут только здесь.
+remote_write:
+  - url: ${REMOTE_WRITE_URL:-http://prometheus:9090/api/v1/write}
+
+scrape_configs:
+  - job_name: vulnscantg-gateway
+    static_configs:
+      - targets: ["gateway:8080"]
+
+  # Каждая реплика воркера скрейпится отдельно: метрики не событийные, и
+  # pushgateway их бы только смешал. Имена задаются статически по той же
+  # причине, что и в /etc/hosts у воркера — DNS под gVisor недоступен.
+  - job_name: vulnscantg-worker
+    static_configs:
+      - targets: ["worker:9100", "deepscan:9100"]
+
+  - job_name: vulnscantg-bot
+    static_configs:
+      - targets: ["bot:9102"]

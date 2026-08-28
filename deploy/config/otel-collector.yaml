@@ -1,0 +1,44 @@
+# Конфигурация приёмника трассировок.
+#
+# Единственное место в контуре, которому позволено выносить телеметрию наружу.
+# Воркер и gateway пишут сюда по внутренней сети и адреса Tempo не знают.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Ограничение памяти обязательно: всплеск трассировок не должен вытеснить
+  # сервисы, ради наблюдения за которыми он и собирается.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # Куда выносить. Два обычных случая:
+  #
+  #   TEMPO_ENDPOINT=tempo:4317              — прямо в Tempo;
+  #   TEMPO_ENDPOINT=otel-collector:4317     — в коллектор общего стека,
+  #                                            если он уже развёрнут отдельно.
+  #
+  # Во втором случае этот коллектор работает мостом: сервисы остаются во
+  # внутренней сети, наружу ходит только он.
+  otlp/tempo:
+    endpoint: ${TEMPO_ENDPOINT:-tempo:4317}
+    tls:
+      insecure: ${TEMPO_INSECURE:-true}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/tempo]
+  telemetry:
+    logs:
+      level: warn

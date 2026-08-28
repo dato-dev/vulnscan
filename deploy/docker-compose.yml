@@ -1,0 +1,433 @@
+# Разворачивание на сервере. Сборки нет — только готовые образы.
+#
+#   docker compose pull && docker compose up -d
+#
+# Все секреты берутся из .env рядом с этим файлом.
+
+name: vulnscan
+
+x-images: &tag ${IMAGE_TAG:-latest}
+
+services:
+  gateway:
+    networks: [backend, egress, lgtp]
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-gateway:${IMAGE_TAG:-latest}
+    env_file: [.env]
+    environment:
+      PYTHONPATH: /app
+      POLICY_FILE: /app/config/policies.json
+      WEIGHTS_FILE: /app/config/weights.json
+      # Ключи доступа. Тенант выводится из ключа, а не из заголовка.
+      KEYS_FILE: /app/config/keys.json
+    volumes:
+      # Монтируется КАТАЛОГ, а не отдельные файлы: отсутствующий файл Docker
+      # молча подменяет каталогом, и сервис получал бы «это каталог» вместо
+      # конфигурации. Пустой каталог означает «настроек нет» — работают
+      # встроенные значения.
+      - ./config:/app/config:ro
+    # Порт наружу НЕ публикуется: бот ходит по внутренней сети.
+    # Нужен внешний доступ — ставьте reverse proxy с TLS и включайте подпись.
+    expose: ["8080"]
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+    restart: unless-stopped
+
+  worker:
+    # ВРЕМЕННО: воркер подключён к сети мониторинга ради трейсов со стадий.
+    #
+    # Это снимает его изоляцию. `lgtp` — обычная bridge, и контейнер в ней
+    # получает выход в интернет; для процесса, который разбирает враждебные
+    # файлы, дыра в парсере превращается из «упал контейнер» в «есть канал
+    # наружу». Ровно от этого его и держали в `internal: true`.
+    #
+    # Вернуть изоляцию: убрать отсюда `lgtp`, поднять мост профилем
+    # `observability` и указать воркерам OTEL_ENDPOINT=http://vs-collector:4318/v1/traces
+    # `deploy/isolation-check.sh` будет падать, пока это здесь.
+    networks: [backend, lgtp]
+    # Ядерная изоляция разбора недоверенных файлов включается отдельным файлом:
+    #   docker compose -f docker-compose.yml -f docker-compose.gvisor.yml up -d
+    # Рантайм и адреса зависимостей заданы там ВМЕСТЕ и разделить их нельзя:
+    # под gVisor не работает встроенный DNS, и один без другого не поднимется.
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-worker:${IMAGE_TAG:-latest}
+    env_file: [.env]
+    environment:
+      PYTHONPATH: /app
+      POLICY_FILE: /app/config/policies.json
+      WEIGHTS_FILE: /app/config/weights.json
+      WORK_DIR: /dev/shm/vulnscan
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      clamd: {condition: service_healthy}
+    restart: unless-stopped
+    # Периметр разбора недоверенного контента.
+    read_only: true
+    tmpfs:
+      - /dev/shm:size=512m,mode=1777
+      - /tmp:size=64m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      replicas: 2
+      resources:
+        limits: {cpus: "2", memory: 2g}
+
+  deepscan:
+    # ВРЕМЕННО: воркер подключён к сети мониторинга ради трейсов со стадий.
+    #
+    # Это снимает его изоляцию. `lgtp` — обычная bridge, и контейнер в ней
+    # получает выход в интернет; для процесса, который разбирает враждебные
+    # файлы, дыра в парсере превращается из «упал контейнер» в «есть канал
+    # наружу». Ровно от этого его и держали в `internal: true`.
+    #
+    # Вернуть изоляцию: убрать отсюда `lgtp`, поднять мост профилем
+    # `observability` и указать воркерам OTEL_ENDPOINT=http://vs-collector:4318/v1/traces
+    # `deploy/isolation-check.sh` будет падать, пока это здесь.
+    networks: [backend, lgtp]
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-worker:${IMAGE_TAG:-latest}
+    env_file: [.env]
+    environment:
+      PYTHONPATH: /app
+      WORKER_MODE: deep
+      CONSUMER_NAME: deep-1
+      CONCURRENCY: 1
+      POLICY_FILE: /app/config/policies.json
+      WEIGHTS_FILE: /app/config/weights.json
+      WORK_DIR: /dev/shm/vulnscan
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      clamd: {condition: service_healthy}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /dev/shm:size=1g,mode=1777
+      - /tmp:size=64m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        limits: {cpus: "2", memory: 3g}
+
+  bot:
+    # Отдельный файл, а не общий .env: его читают ВСЕ сервисы, и учётные данные
+    # прокси оказались бы в окружении воркера — контейнера, который разбирает
+    # враждебные файлы. Здесь их получают только те, кому связь наружу нужна
+    # по назначению. Файла может не быть — тогда ходим напрямую.
+    env_file:
+      - .env
+      - path: proxy.env
+        required: false
+    networks:
+      backend:
+        ipv4_address: 172.20.0.13
+      egress:
+      lgtp:
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-bot:${IMAGE_TAG:-latest}
+    environment:
+      PYTHONPATH: /app
+      SCANNER_URL: http://gateway:8080
+      TENANT: telegram-bot
+      # Сканер обращается к боту по внутренней сети; наружу порт не публикуется.
+      WEBHOOK_URL: http://bot:8090/webhooks/vulnscan
+
+    expose: ["8090"]
+    depends_on: [gateway]
+    restart: unless-stopped
+
+  # Мост телеметрии наружу.
+  #
+  # Имя НЕ `otel-collector` намеренно. Когда телеметрия уходит в общий стек
+  # (Grafana/Tempo в своей сети), там уже есть контейнер с таким именем, а
+  # Compose вешает имя сервиса сетевым алиасом на КАЖДУЮ сеть, куда сервис
+  # входит. Два ответа на одно имя дают резолв по кругу, и половина трейсов
+  # уходит не туда. Собственное имя эту коллизию снимает.
+  #
+  # Стоит в обеих сетях: сервисы дотягиваются по `backend`, наружу выносит он.
+  # Так воркер остаётся без выхода в интернет — это и есть смысл конструкции:
+  # подключать сам воркер к сети мониторинга нельзя, она обычная bridge с
+  # доступом наружу, и изоляция разбора враждебных файлов на этом кончится.
+  # Мост наружу. Сейчас НЕ используется: сервисы подключены к сети мониторинга
+  # напрямую. Нужен, когда воркеру вернут изоляцию — тогда он единственный
+  # ходит в `lgtp`, а воркер остаётся в `internal: true`.
+  vs-collector:
+    networks:
+      backend:
+        ipv4_address: 172.20.0.14
+      # Сеть общего стека мониторинга. Только этот сервис в ней и состоит:
+      # она обычная bridge с выходом наружу, и воркеру там делать нечего.
+      lgtp:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    command: ["--config=/vsconfig/otel-collector.yaml"]
+    # Монтируется КАТАЛОГ в нейтральную точку, а не отдельные файлы в места,
+    # принадлежащие образу. Отсутствующий файл Docker молча создаёт каталогом,
+    # и контейнер падает с «not a directory» — так уже трижды не поднимался
+    # стек. С каталогом этого класса ошибок нет: нет файла — сервис скажет об
+    # этом сам и своими словами.
+    volumes:
+      - ./config:/vsconfig:ro
+    restart: unless-stopped
+    profiles: ["observability"]
+
+  # Точка входа для внешних клиентов. Поднимается профилем `public`.
+  #
+  #   docker compose --profile public up -d
+  #
+  # Без него сервис доступен только изнутри — так и задумано для развёртывания,
+  # где бот стоит рядом.
+  proxy:
+    networks: [backend, egress]
+    image: caddy:2.9-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PUBLIC_DOMAIN: ${PUBLIC_DOMAIN:?задайте PUBLIC_DOMAIN в .env}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-64}
+    command: ["caddy", "run", "--config", "/vsconfig/Caddyfile", "--adapter", "caddyfile"]
+    # Монтируется КАТАЛОГ в нейтральную точку, а не отдельные файлы в места,
+    # принадлежащие образу. Отсутствующий файл Docker молча создаёт каталогом,
+    # и контейнер падает с «not a directory» — так уже трижды не поднимался
+    # стек. С каталогом этого класса ошибок нет: нет файла — сервис скажет об
+    # этом сам и своими словами.
+    volumes:
+      - ./config:/vsconfig:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [gateway]
+    restart: unless-stopped
+    profiles: ["public"]
+
+  # Доставка результатов клиентам.
+  #
+  # Вынесена из воркера намеренно. Коллбэк подписывается ключом тенанта, и
+  # держать ключи всех тенантов в процессе, разбирающем враждебные файлы,
+  # значит менять одну дыру в парсере на компрометацию всех клиентов сразу.
+  # Здесь недоверенный контент не разбирается — только HTTP наружу.
+  notifier:
+    networks: [backend, egress, lgtp]
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-notifier:${IMAGE_TAG:-latest}
+    env_file:
+      - .env
+      - path: proxy.env
+        required: false
+    environment:
+      PYTHONPATH: /app
+      KEYS_FILE: /app/config/keys.json
+      METRICS_PORT: "9103"
+    volumes:
+      - ./config:/app/config:ro
+    depends_on:
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  # История проверок. Единственный сервис с доступом к PostgreSQL.
+  #
+  # Отдельно от воркера намеренно: воркер разбирает враждебные файлы, и сетевой
+  # доступ к базе из него — лишняя дверь. Результаты доезжают сюда потоком Redis.
+  writer:
+    networks: [backend, lgtp]
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-writer:${IMAGE_TAG:-latest}
+    env_file: [.env]
+    environment:
+      PYTHONPATH: /app
+      METRICS_PORT: "9101"
+    depends_on:
+      redis: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+    restart: unless-stopped
+
+  postgres:
+    networks:
+      backend:
+        ipv4_address: 172.20.0.16
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vulnscan}
+      POSTGRES_USER: ${POSTGRES_USER:-vulnscan}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vulnscan}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      # Для 17 путь именно .../data. У образов 18+ он другой: данные лежат в
+      # подкаталоге с именем мажорной версии, и монтирование на .../data
+      # заставляет образ отказаться стартовать. Меняете мажорную версию —
+      # проверьте путь, молча оно не переедет.
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # Метрики. Имя своё по той же причине, что и у моста: в общем стеке уже есть
+  # контейнер `prometheus`, а Compose вешает имя сервиса алиасом на каждую сеть.
+  #
+  # Живёт в `backend`, потому что цели там: Prometheus общего стека до сервисов
+  # во внутренней сети не дотянется. Отдавать данные наружу — через
+  # `remote_write` в config/prometheus.yml, а не подключением сервисов к нему.
+  vs-prometheus:
+    networks:
+      backend:
+      lgtp:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/vsconfig/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    # Монтируется КАТАЛОГ в нейтральную точку, а не отдельные файлы в места,
+    # принадлежащие образу. Отсутствующий файл Docker молча создаёт каталогом,
+    # и контейнер падает с «not a directory» — так уже трижды не поднимался
+    # стек. С каталогом этого класса ошибок нет: нет файла — сервис скажет об
+    # этом сам и своими словами.
+    volumes:
+      - ./config:/vsconfig:ro
+      - prometheus-data:/prometheus
+    expose: ["9090"]
+    restart: unless-stopped
+    profiles: ["observability"]
+
+  clamd:
+    # Выхода наружу больше НЕТ: за базами ходит только cvdmirror, а clamd берёт
+    # их у него по внутренней сети. Раньше clamd стоял в `egress` ради
+    # freshclam — теперь этот повод исчез, и поверхность стала меньше.
+    networks:
+      backend:
+        ipv4_address: 172.20.0.12
+    image: clamav/clamav:1.4
+    environment:
+      CLAMAV_NO_FRESHCLAMD: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping 1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 240s
+    volumes:
+      - clamav-db:/var/lib/clamav
+      # Отдельный файл, а не каталог: /etc/clamav принадлежит образу, там же
+      # лежит clamd.conf, и подменять весь каталог нельзя.
+      #
+      # Цена — отсутствующий на хосте файл Docker молча создаёт КАТАЛОГОМ, и
+      # контейнер падает с «not a directory». Ловится в deploy/preflight.sh,
+      # запускайте его перед `up`.
+      - ./config/freshclam.conf:/etc/clamav/freshclam.conf:ro
+    restart: unless-stopped
+
+  # Локальное зеркало баз ClamAV. Единственный, кто ходит за ними наружу.
+  #
+  # Так требует сам ClamAV: их CDN режет тех, кто скачивает часто и полными
+  # файлами. Отсюда и `429`/`403` с суточным баном, если freshclam не смог
+  # проверить версию через DNS и свалился в скачивание целиком.
+  cvdmirror:
+    networks:
+      backend:
+        ipv4_address: 172.20.0.15
+      egress:
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-cvdmirror:${IMAGE_TAG:-latest}
+    # Прокси там, где до CDN не дойти напрямую. Файла может не быть.
+    env_file:
+      - path: proxy.env
+        required: false
+    environment:
+      CVD_DB_DIR: /db
+      CVD_PORT: "8000"
+      # Раз в четыре часа. ClamAV просит не чаще раза в час; у нас с запасом.
+      CVD_UPDATE_INTERVAL_S: ${CVD_UPDATE_INTERVAL_S:-14400}
+      # Резолвер задаётся явно: cvdupdate сам спрашивает TXT-запись, чтобы
+      # понять, нужно ли качать. Там, где системный DNS подменяют, ответ
+      # приходит битым — и дальше следует бан за скачивание полными файлами.
+      CVD_NAMESERVER: ${CVD_NAMESERVER:-1.1.1.1}
+    volumes:
+      - cvd-db:/db
+    expose: ["8000"]
+    restart: unless-stopped
+
+  redis:
+    networks:
+      backend:
+        ipv4_address: 172.20.0.10
+    image: redis:7-alpine
+    # Запись на диск включена. Без неё перезапуск Redis терял принятые, но не
+    # обработанные задачи: клиент получил `202`, а вердикт не приходил никогда.
+    # Группа потребителей восстанавливалась сама, задачи — нет.
+    #
+    # `everysec` вместо `always`: последний способ теряет до нуля, но делает
+    # fsync на каждую запись и упирается в диск на горячем пути. Остаточный
+    # риск — до секунды принятых задач при жёстком падении хоста; на этот
+    # случай работает идемпотентность по sha256, повторная присылка файла
+    # проверит его заново.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --dir
+      - /data
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  minio:
+    networks:
+      backend:
+        ipv4_address: 172.20.0.11
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - minio-data:/data
+    # Консоль наружу не публикуется.
+    restart: unless-stopped
+
+networks:
+  # Сеть без выхода наружу. Здесь живёт то, что не должно иметь связи с
+  # внешним миром: воркер, разбирающий недоверенные файлы, и хранилища.
+  #
+  # Подсеть закреплена, а адреса зависимостей заданы явно. Это нужно ради
+  # gVisor: под `runsc` встроенный DNS Docker не работает (см. ниже у воркера),
+  # и единственный способ обращаться к сервисам по имени — заранее известные
+  # адреса в /etc/hosts.
+  backend:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+  # Сеть общего стека мониторинга (Grafana/Tempo/Loki). Создаётся его compose,
+  # здесь только подключаемся. Нет такого стека — удалите `lgtp` у vs-collector
+  # и vs-prometheus и верните им `egress`.
+  lgtp:
+    external: true
+    name: lgtp
+
+  # Для тех, кому связь нужна по назначению: gateway принимает запросы
+  # снаружи, clamd тянет сигнатурные базы, бот ходит в Telegram.
+  # Воркера здесь нет — в этом весь смысл.
+  egress: {}
+
+volumes:
+  caddy-data:
+  caddy-config:
+  postgres-data:
+  prometheus-data:
+  redis-data:
+  cvd-db:
+  clamav-db:
+  minio-data:

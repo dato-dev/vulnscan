@@ -1,0 +1,26 @@
+{
+  "team-a": {
+    "fail_mode": "suspicious",
+    "block_threshold": 80,
+    "suspicious_threshold": 30,
+    "default_profile": "standard",
+    "max_wait_ms": 2000,
+    "rate_limit_per_min": 1200,
+    "max_concurrent_scans": 64,
+    "shadow_mode": false
+  },
+  "team-legal": {
+    "fail_mode": "fail-closed",
+    "block_threshold": 60,
+    "suspicious_threshold": 20,
+    "default_profile": "strict",
+    "max_wait_ms": 5000,
+    "weight_overrides": {
+      "PDF_EMBEDDED_FILE": 80,
+      "PDF_EXTERNAL_URI": 30
+    },
+    "rate_limit_per_min": 120,
+    "max_concurrent_scans": 8,
+    "max_upload_bytes": 20971520
+  }
+}

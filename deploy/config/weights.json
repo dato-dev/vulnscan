@@ -1,0 +1,18 @@
+{
+  "_комментарий": "Переопределяет встроенные веса. Ключи, которых здесь нет, берутся из vscommon/weights.py. Правка этого файла не требует пересборки образа.",
+
+  "PDF_LAUNCH":         {"score": 85, "severity": "critical"},
+  "PDF_OPENACTION":     {"score": 45, "severity": "high"},
+  "PDF_JAVASCRIPT":     {"score": 45, "severity": "high"},
+  "PDF_EMBEDDED_FILE":  {"score": 50, "severity": "high"},
+  "PDF_MALFORMED":      {"score": 35, "severity": "medium"},
+
+  "_": "Ниже — пример настройки под поток сканов паспортов: внешние ссылки в документе там подозрительнее обычного, а объектные потоки встречаются в каждом втором файле",
+  "PDF_EXTERNAL_URI":   {"score": 25, "severity": "medium"},
+  "PDF_OBJSTM":         {"score": 0,  "severity": "info"},
+
+  "YARA:critical":      {"score": 95, "severity": "critical"},
+  "YARA:high":          {"score": 60, "severity": "high"},
+  "YARA:medium":        {"score": 35, "severity": "medium"},
+  "YARA:low":           {"score": 15, "severity": "low"}
+}

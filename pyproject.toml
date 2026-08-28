@@ -1,0 +1,109 @@
+[project]
+name = "vulnscantg"
+version = "0.1.0"
+description = "CDR и детект вредоносного содержимого во вложениях чат-бота"
+requires-python = ">=3.12"
+
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "redis>=5.2",
+    "httpx>=0.28",
+    "python-multipart>=0.0.12",
+    "boto3>=1.35",
+    "pikepdf>=9.4",
+    "pillow>=11.0",
+    "clamd>=1.0.2",
+    "python-magic>=0.4.27",
+    "yara-python>=4.5",
+    # Телеметрия. Сервис обязан работать и без неё: отсутствующий SDK
+    # выключает трассировку и метрики, но не проверку файлов.
+    "opentelemetry-api>=1.29",
+    "opentelemetry-sdk>=1.29",
+    "opentelemetry-exporter-otlp-proto-http>=1.29",
+    "prometheus-client>=0.21",
+    # История проверок. Доступ к БД есть только у Result Writer.
+    "asyncpg>=0.30",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "fakeredis>=2.26",
+    "ruff>=0.7",
+    "mypy>=1.13",
+]
+
+[tool.setuptools]
+packages = []
+
+[tool.ruff]
+line-length = 100
+# Внешний генератор тестового корпуса: не наш стиль, не форматируем.
+extend-exclude = ["badpdfgen"]
+target-version = "py312"
+src = [
+    "packages",
+    "services/gateway",
+    "services/worker",
+    "services/bot",
+    "services/writer",
+    "services/notifier",
+    "tests",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "S", "C4", "SIM", "RUF", "T20"]
+ignore = [
+    "S101",             # assert разрешён в тестах
+    "RUF001", "RUF002", "RUF003",  # кириллица в строках, докстрингах и комментариях
+    "B008",             # Depends()/File() в дефолтах — идиома FastAPI
+    "S104",             # bind 0.0.0.0 внутри контейнера — норма
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "T20"]
+"samples/*" = ["T20"]
+"bench/*" = ["T20", "E402"]
+"docs/*" = ["T20", "E402"]
+"corpus/*" = ["T20", "E402", "S310"]  # печать отчёта и загрузка по фиксированному URL   # печать результатов и импорт после sys.path
+"packages/vscommon/config.py" = ["S105"]
+"services/bot/botapp/config.py" = ["S105"]  # дефолт-заглушка, значение из env   # дефолты-заглушки, реальные значения из env
+"services/worker/worker_app/config.py" = ["S108"] # /dev/shm — намеренный tmpfs, не /tmp
+# Отчёт для оператора, а не цикл сервиса: его вывод и есть результат работы.
+# Запрет на print защищает горячий путь от записи мимо структурных логов —
+# к разовому запуску из консоли это не относится.
+"services/writer/writerapp/usage.py" = ["T20"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "packages:services/gateway:services/worker"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    # Строгий режим: предупреждение ломает прогон. Иначе настоящие тонут в шуме,
+    # а среди них бывают DeprecationWarning от библиотек, разбирающих
+    # недоверенный контент, — эти пропускать нельзя.
+    "error",
+    # Сэмплы с аннотациями формы намеренно собраны так, чтобы виджеты были
+    # недостижимы из /AcroForm: на таких документах и проверяется разбор.
+    # Подавляем ровно этот класс от ровно этого модуля.
+    "ignore::pikepdf._methods.PageCopyWarning",
+    # Чужое устаревание: starlette просит httpx2. Обновление тянет смену
+    # HTTP-клиента во всех сервисах — отдельная задача, а не тихий апгрейд
+    # посреди работы над долгами.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    # Незакрытые сокеты fakeredis в тестовых фикстурах. Это гигиена тестов, а
+    # не утечка в сервисе: предупреждение всплывает при сборке мусора от
+    # предыдущего теста. Разбирается отдельно (D4), глушить продуктовые
+    # ResourceWarning этим не хочется — но и городить закрытие в двадцати
+    # местах посреди работы над долгами тоже.
+    "ignore::ResourceWarning",
+]
+asyncio_mode = "auto"
