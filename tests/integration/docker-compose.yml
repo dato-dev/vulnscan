@@ -1,0 +1,40 @@
+# Зависимости для интеграционных тестов: только настоящие Redis и PostgreSQL.
+#
+#   docker compose -f tests/integration/docker-compose.yml up -d
+#   make test-integration
+#   docker compose -f tests/integration/docker-compose.yml down -v
+#
+# Ни воркера, ни антивируса здесь нет намеренно: проверяется цепочка хранения,
+# а не разбор файлов. Всё, что можно подделать без потери смысла, подделано в
+# обычных тестах — сюда попадает только то, где заглушка и врала.
+
+name: vulnscan-itest
+
+services:
+  redis:
+    image: redis:7-alpine
+    # Как в бою: без записи на диск поведение потоков при перезапуске другое.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  postgres:
+    # Версия настраивается: в бою 17, но схема и запросы одинаковы начиная
+    # с 14, и прогонять тесты на том, что уже скачано, дешевле.
+    image: postgres:${ITEST_PG_TAG:-17-alpine}
+    environment:
+      POSTGRES_DB: vulnscan_test
+      POSTGRES_USER: vulnscan
+      POSTGRES_PASSWORD: vulnscan
+    ports:
+      - "15432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vulnscan"]
+      interval: 2s
+      timeout: 2s
+      retries: 15

@@ -1,0 +1,98 @@
+# Prometheus общего стека мониторинга.
+#
+# Он же скрейпит сервисы vulnscantg напрямую: пока они подключены к сети `lgtp`,
+# он до них дотягивается. Когда воркеру вернут изоляцию (`internal: true`), эти
+# цели станут недоступны, и понадобится отдельный Prometheus во внутренней сети
+# с `remote_write` сюда — см. deploy/docker-compose.yml, профиль observability.
+#
+# `remote_write` здесь НЕ нужен: он был бы записью в самого себя.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Без этого блока правила загружаются и срабатывают, но никуда не уходят:
+# alertmanager в стеке есть, а Prometheus о нём не знает.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+rule_files:
+  # Путь внутри контейнера: каталог монтируется из ./prometheus/rules.
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  # Метрики из трейсов: их считает коллектор, а не генератор Tempo.
+  # Отсюда берутся traces_span_metrics_* и traces_service_graph_*, на которых
+  # держатся граф сервисов и «p95 по спанам».
+  - job_name: otel-collector-traces
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  # Собственные метрики коллектора: очереди, отказы экспорта.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  - job_name: vulnscantg-gateway
+    static_configs:
+      - targets: ["gateway:8080"]
+
+  # Каждая реплика воркера скрейпится отдельно: метрики не событийные, и
+  # pushgateway их бы только смешал. Имена задаются статически по той же
+  # причине, что и в /etc/hosts у воркера — DNS под gVisor недоступен.
+  - job_name: vulnscantg-worker
+    static_configs:
+      - targets: ["worker:9100", "deepscan:9100"]
+
+  - job_name: vulnscantg-bot
+    static_configs:
+      - targets: ["bot:9102"]
+
+  # Доставку результатов считает notifier, а не воркер: коллбэки уехали туда
+  # вместе с ключами тенантов. Без этой цели панель «Коллбэки» пуста всегда.
+  - job_name: vulnscantg-notifier
+    static_configs:
+      - targets: ["notifier:9103"]
+
+  - job_name: vulnscantg-writer
+    static_configs:
+      - targets: ["writer:9101"]
+
+  # ─────────────────────────────────────────────────────────────────
+  # Сам стек мониторинга. Эти цели нужны не для красоты: когда Loki
+  # перестаёт принимать логи, а Tempo — трейсы, узнать об этом больше
+  # неоткуда, потому что оба молчат ровно так же, как при отсутствии
+  # трафика.
+  # ─────────────────────────────────────────────────────────────────
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  - job_name: grafana
+    static_configs:
+      - targets: ["grafana:3000"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]
+
+  # Alloy возит логи Docker в Loki. Его собственные метрики — единственный
+  # способ увидеть, что он отстаёт от потока или потерял позицию в файле.
+  - job_name: alloy
+    static_configs:
+      - targets: ["alloy:12345"]
+
+  # Хост: CPU, память, диск. Порт 9100 совпадает с портом воркера, но это
+  # разные контейнеры в разных заданиях — пересечения нет.
+  - job_name: node-exporter
+    static_configs:
+      - targets: ["node-exporter:9100"]

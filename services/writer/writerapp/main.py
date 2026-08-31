@@ -37,6 +37,8 @@ class Writer:
         self._stream = ResultStream(self._redis, settings.results_stream, settings.results_group)
         self._db = Database(settings.postgres_dsn)
         self._stopping = asyncio.Event()
+        self._batch: list[tuple[str, ScanRecord]] = []
+        self._lock = asyncio.Lock()
 
     async def start(self) -> None:
         await self._db.connect()
@@ -48,24 +50,48 @@ class Writer:
 
         logger.info("writer запущен", extra={"consumer": settings.consumer_name})
         prune_task = asyncio.create_task(self._prune_loop())
+        flush_task = asyncio.create_task(self._flush_loop())
 
-        batch: list[tuple[str, ScanRecord]] = []
         try:
             async for entry_id, record in self._stream.consume(settings.consumer_name):
                 if self._stopping.is_set():
                     break
-                batch.append((entry_id, record))
-                if len(batch) >= settings.batch_size:
-                    await self._flush(batch)
-                    batch = []
+                async with self._lock:
+                    self._batch.append((entry_id, record))
+                    full = len(self._batch) >= settings.batch_size
+                if full:
+                    await self._flush_pending()
         finally:
             # Незаписанное дописываем на выходе: иначе штатная остановка теряла
-            # бы последнюю пачку, хотя задачи уже подтверждены воркером.
-            if batch:
-                await self._flush(batch)
-            prune_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await prune_task
+            # бы последнюю пачку.
+            await self._flush_pending()
+            for task in (prune_task, flush_task):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    async def _flush_loop(self) -> None:
+        """Сброс по времени.
+
+        Без него пачка ждала бы, пока наберётся целиком: при пяти сканах в час
+        история оставалась бы невидимой до перезапуска — а ради неё writer и
+        существует. Размер пачки экономит транзакции, но не должен превращаться
+        в срок хранения в памяти.
+        """
+        while not self._stopping.is_set():
+            await asyncio.sleep(settings.flush_interval_s)
+            await self._flush_pending()
+
+    async def _flush_pending(self) -> None:
+        """Забирает накопленное под замком и пишет.
+
+        Замок здесь обязателен: цикл чтения и цикл сброса работают
+        одновременно, и без него пачку можно записать дважды или потерять.
+        """
+        async with self._lock:
+            batch, self._batch = self._batch, []
+        if batch:
+            await self._flush(batch)
 
     async def _flush(self, batch: list[tuple[str, ScanRecord]]) -> None:
         """Записывает пачку и подтверждает её.
@@ -78,8 +104,13 @@ class Writer:
         try:
             written = await self._db.store(records)
         except Exception:
-            logger.exception("не удалось записать историю, пачка остаётся в потоке")
+            # Записи не подтверждены в потоке, поэтому не потеряны: вернём их
+            # в пачку и попробуем снова. Без возврата они ушли бы из памяти,
+            # а из потока — только по истечении срока хранения.
+            logger.exception("не удалось записать историю, повторим")
             metrics().stage_failures.labels(stage="writer", reason="db").inc()
+            async with self._lock:
+                self._batch = batch + self._batch
             return
 
         for entry_id, _record in batch:

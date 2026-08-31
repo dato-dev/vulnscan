@@ -323,6 +323,22 @@ class Worker:
                     await self._queue.ack(entry_id)
                     return
 
+                # Жизненный цикл скана — уровень INFO (см. CLAUDE.md). Gateway
+                # пишет «принят», здесь — «взят в работу»: без этой записи между
+                # приёмом и завершением зияет дыра, и по логам не понять, дошла
+                # ли задача до воркера вообще.
+                logger.info(
+                    "задача взята в работу",
+                    extra={
+                        "размер": job.size,
+                        "тип": job.filename_ext or "?",
+                        "профиль": job.profile.value,
+                        "режим": "углублённый" if job.deep else "быстрый",
+                        "консьюмер": settings.consumer_name,
+                        "из_кэша": job.cached is not None,
+                    },
+                )
+
                 previous = await self._journal.load(job.scan_id)
 
                 if previous is not None and crashed_on_content(
@@ -506,6 +522,7 @@ class Worker:
                     for f in facts.findings
                     if f.stage != "clamav" and f.code not in REQUEST_DERIVED_CODES
                 ],
+                detected_mime=facts.detected_mime,
                 encrypted=facts.encrypted,
                 supported=facts.supported,
                 failed_stages={s for s in facts.failed_stages if s != "clamav"},

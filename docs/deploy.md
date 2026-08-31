@@ -15,10 +15,16 @@ make push    NAMESPACE=dato1   # собрать и запушить
 Текущие образы в Docker Hub:
 
 ```
-dato1/vulnscantg-gateway
-dato1/vulnscantg-worker
-dato1/vulnscantg-bot
+dato1/vulnscantg-gateway     приём файлов, кэш, очередь
+dato1/vulnscantg-worker      конвейер и CDR; он же в роли deepscan
+dato1/vulnscantg-notifier    доставка результата, подпись ключом тенанта
+dato1/vulnscantg-writer      история проверок в PostgreSQL
+dato1/vulnscantg-cvdmirror   локальное зеркало баз ClamAV
+dato1/vulnscantg-bot         Telegram-бот
 ```
+
+Демонстрационный сайт (`vulnscantg-demo-site`) собирается отдельно и в
+`make push` не входит: это пример подключения, а не часть сервиса.
 
 Переменные: `NAMESPACE` (аккаунт), `REGISTRY` (пусто — Docker Hub, иначе
 `ghcr.io` и подобные), `PROJECT` (`vulnscantg`), `TAG` (короткий хэш коммита),
@@ -41,15 +47,36 @@ Docker Hub не поддерживает вложенные пространст
 
 Сборки на сервере нет, только pull:
 
+На сервер копируется каталог `deploy/` целиком — сам compose-файл, `config/`
+и заполненный `.env`. Исходников там нет и не нужно.
+
 ```bash
-export IMAGE_TAG=<тег>          # или latest
-docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+cd deploy
+sh preflight.sh                 # проверяет конфигурацию до запуска
+docker compose pull && docker compose up -d
 ```
 
-Оверлей `docker-compose.prod.yml` подменяет сборку на готовые образы, включает
-подпись запросов и JSON-логи, снимает эмуляцию с `clamd` (на x86 она не нужна).
-Секреты берутся из `.env` рядом с compose-файлом.
+`IMAGE_TAG` задаётся в `.env`, а не в командной строке: иначе следующий
+`up -d` без переменной откатит на `latest`.
+
+Проверку `preflight.sh` пропускать не стоит — она ловит ровно то, что иначе
+проявляется циклом перезапуска: отсутствующий файл конфигурации (Docker молча
+подменяет его каталогом), незаполненный `POSTGRES_PASSWORD`, отсутствующий
+`config/keys.json` — без него gateway отвергает **все** запросы.
+
+### Необязательные профили
+
+```bash
+docker compose --profile observability up -d   # мост телеметрии и Prometheus
+docker compose --profile public up -d          # точка входа с TLS
+```
+
+Изоляция воркера под gVisor включается отдельным файлом — рантайм и адреса
+зависимостей должны меняться вместе:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gvisor.yml up -d
+```
 
 ## Что нужно на хосте
 
@@ -106,7 +133,10 @@ make samples && make smoke
 ## Телеграм-бот
 
 ```bash
-TELEGRAM_BOT_TOKEN=<токен от @BotFather> docker compose --profile bot up -d bot
+# Токен вписывается в .env, а не в командную строку: оттуда он попадёт
+# в историю оболочки.
+#   TELEGRAM_TOKEN=<токен от @BotFather>
+docker compose up -d bot
 ```
 
 Токен читается только из окружения. Без него контейнер поднимется, напишет об

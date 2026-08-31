@@ -297,12 +297,16 @@ class Pipeline:
         logger.info(
             "скан завершён",
             extra={
-                "verdict": result.verdict.value,
-                "score": result.score,
-                "findings": len(result.findings),
-                "sanitized": result.sanitized is not None,
-                "unscannable": result.unscannable(),
-                "elapsed_ms": result.elapsed_ms,
+                "вердикт": result.verdict.value,
+                "балл": result.score,
+                "признаки": [f.code for f in result.findings][:8],
+                "пересобран": result.sanitized is not None,
+                "непроверяем": result.unscannable(),
+                "мс": result.elapsed_ms,
+                # На что ушло время. Без разбивки «скан занял 900 мс» не
+                # говорит ничего: непонятно, тормозит антивирус, растеризация
+                # или разбор структуры.
+                "стадии": {t.stage: t.elapsed_ms for t in timings},
             },
         )
         return result

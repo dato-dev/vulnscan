@@ -1,0 +1,118 @@
+# Правила алертов Prometheus.
+#
+# Подключается в prometheus.yml через `rule_files`.
+#
+# Общий принцип: тревога поднимается там, где сервис продолжает отвечать, но
+# отвечает неправильно. Упавший контейнер заметят и без нас; молча деградировавшая
+# проверка — нет, и именно она уже несколько раз выдавала `clean` на всё подряд.
+groups:
+  - name: vulnscantg-корректность
+    rules:
+      # Самое важное правило во всём файле.
+      - alert: БазыАнтивирусаУстарели
+        expr: vs_rules_age_seconds{kind="av_db"} > 86400
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "Базы ClamAV не обновлялись больше суток"
+          description: >-
+            Остановившееся обновление выглядит как работающее: clamd доволен
+            базой, которую нашёл при старте. Проверьте cvdmirror — не упёрся ли
+            он в ограничение частоты у CDN и доходит ли до сети вообще.
+
+      - alert: БазыАнтивирусаНепригодны
+        expr: vs_rules_age_seconds{kind="av_db"} > 604800
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Базы ClamAV старше недели — вердиктам верить нельзя"
+          description: >-
+            Gateway при таком возрасте объявляет себя неготовым: `clean` по
+            сигнатурам недельной давности ничего не значит.
+
+      - alert: СтадииМассовоПадают
+        expr: sum by (stage) (rate(vs_stage_failures_total[5m])) > 0.1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Стадия {{ $labels.stage }} падает чаще раза в 10 секунд"
+          description: >-
+            Отказ стадии сам по себе вердикт не меняет — он даёт признак с
+            низким весом. Массовые отказы означают, что проверка фактически не
+            выполняется, а файлы продолжают получать вердикт.
+
+      - alert: ДоляВредоносныхАномальна
+        expr: >-
+          sum(rate(vs_scans_total{verdict="malicious"}[30m]))
+          / clamp_min(sum(rate(vs_scans_total[30m])), 0.001) > 0.3
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Больше трети файлов признаны вредоносными"
+          description: >-
+            Обычно это не атака, а сломанное правило или вес: ровно так одна
+            проверка `/OpenAction` пометила 26 из 80 обычных PDF.
+
+  - name: vulnscantg-очередь
+    rules:
+      - alert: ОчередьРастёт
+        expr: sum(vs_queue_depth) > 100
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "В очереди больше 100 неразобранных задач"
+
+      - alert: ЕстьЗадачиНаРазборЧеловеком
+        expr: vs_dlq_size > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "В dead-letter лежат непроверенные файлы"
+          description: >-
+            Эти файлы никто не проверил, и отправитель об этом не знает.
+            Записи живут 7 дней, после чего исчезают вместе с историей.
+
+      - alert: КоллбэкиТеряются
+        expr: rate(vs_callbacks_total{outcome="lost"}[15m]) > 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "Результаты не доходят до клиента"
+          description: >-
+            Проверка состоялась, но вердикт потерян после исчерпания попыток.
+            Для клиента это неотличимо от того, что файл не проверяли.
+
+  - name: vulnscantg-латентность
+    rules:
+      - alert: ВердиктМедленный
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (le) (rate(vs_verdict_duration_seconds_bucket[10m]))) > 0.7
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "p95 времени до вердикта выше цели в 700 мс"
+          description: >-
+            Синхронные ответы начнут уходить в коллбэк, и клиенты, которые его
+            не реализовали, останутся без результата.
+
+      - alert: КэшПерестабРаботать
+        expr: >-
+          sum(rate(vs_cache_lookups_total{outcome="hit"}[30m]))
+          / clamp_min(sum(rate(vs_cache_lookups_total[30m])), 0.001) < 0.1
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "Попаданий в кэш меньше 10%"
+          description: >-
+            Обычно означает, что отпечаток правил или весов меняется чаще, чем
+            должен, и каждый файл проверяется заново.
+
+  - name: vulnscantg-доступность
+    rules:
+      - alert: СервисНеОтвечает
+        expr: up{job=~"vulnscantg.*"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.instance }} не отвечает на скрейп"

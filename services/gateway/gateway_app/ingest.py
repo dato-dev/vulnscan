@@ -18,6 +18,7 @@ from vscommon.models import (
     CachedStructural,
     ObjectRef,
     ScanJob,
+    ScanRecord,
     ScanRequest,
     ScanResult,
     ScanStatus,
@@ -85,7 +86,7 @@ class Ingestor:
             sha256 = hasher.hexdigest
             _check_idempotency_key(idempotency_key, sha256)
 
-            probe = await self._lookup_cache(sha256, request)
+            probe = await self._lookup_cache(sha256, request, hasher.size)
             if probe.result is not None:
                 return probe.result, True
 
@@ -115,7 +116,7 @@ class Ingestor:
         policy = self._state.policies.for_tenant(request.tenant)
         return (request.profile or policy.default_profile).value
 
-    async def _lookup_cache(self, sha256: str, request: ScanRequest) -> CacheProbe:
+    async def _lookup_cache(self, sha256: str, request: ScanRequest, size: int) -> CacheProbe:
         policy = self._state.policies.for_tenant(request.tenant)
         structural = await self._state.structural.get(
             sha256,
@@ -173,6 +174,11 @@ class Ingestor:
         # идентификатор, и без этой строки клиент не мог забрать собственный
         # результат: проверка владения честно отвечала `404`.
         await self._state.ownership.claim(result.scan_id, request.tenant)
+        # История пишется и здесь. Ответ из кэша — такая же оказанная услуга:
+        # тенант получил вердикт, и без записи он мог бы прислать тысячу файлов,
+        # а по документам не сделать ни одной проверки. Воркер сюда не заходит
+        # вовсе, так что кроме gateway записать некому.
+        await self._record_history(result, request, size)
         logger.info("полный кэш-хит", extra={"verdict": result.verdict.value})
         return CacheProbe(result=result)
 
@@ -199,6 +205,26 @@ class Ingestor:
         current.verdict_seconds.labels(
             profile=profile, cached=str(cached is not None).lower()
         ).observe(elapsed_s)
+
+    async def _record_history(self, result: ScanResult, request: ScanRequest, size: int) -> None:
+        """Отправляет запись в поток истории.
+
+        Отказ не прерывает ответ клиенту: вердикт важнее истории. В базу
+        gateway не ходит — там владеет только Result Writer.
+        """
+        try:
+            await self._state.history.publish(
+                ScanRecord(
+                    result=result,
+                    tenant=request.tenant,
+                    size=size,
+                    detected_mime=result.facts.detected_mime if result.facts else None,
+                    rules_version=await self._state.rules_version(),
+                    av_db_version=await self._state.engine_version(),
+                )
+            )
+        except Exception:
+            logger.exception("не удалось записать ответ из кэша в историю")
 
     async def _dispatch(
         self,

@@ -135,6 +135,10 @@ services:
       TENANT: telegram-bot
       # Сканер обращается к боту по внутренней сети; наружу порт не публикуется.
       WEBHOOK_URL: http://bot:8090/webhooks/vulnscan
+      # Явно, а не умолчанием из кода: общий .env задаёт METRICS_PORT=9100
+      # всем сервисам сразу и перекрывает значение по умолчанию. Бот из-за
+      # этого слушал 9100, а Prometheus ходил на 9102 и получал отказ.
+      METRICS_PORT: "9102"
 
     expose: ["8090"]
     depends_on: [gateway]

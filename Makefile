@@ -1,4 +1,4 @@
-.PHONY: help venv up down logs test lint fmt typecheck samples smoke \
+.PHONY: help venv up down logs test test-integration lint fmt typecheck samples smoke \
         corpus corpus-check findings-doc buildx-setup images push release
 
 # Локальный venv используется, если он есть: системный python может быть старее 3.12.
@@ -73,6 +73,13 @@ down:  ## Остановить и удалить тома
 
 logs:  ## Логи gateway и воркеров
 	docker compose logs -f gateway worker
+
+test-integration:  ## Интеграционные тесты: нужны настоящие Redis и PostgreSQL
+	docker compose -f tests/integration/docker-compose.yml up -d --wait
+	$(PY) -m pytest tests/integration -v -p no:cacheprovider; \
+		status=$$?; \
+		docker compose -f tests/integration/docker-compose.yml down -v; \
+		exit $$status
 
 test:  ## Прогнать тесты
 	$(PY) -m pytest -q

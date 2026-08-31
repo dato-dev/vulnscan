@@ -1,0 +1,115 @@
+# Конфигурация приёмника трассировок.
+#
+# Единственное место в контуре, которому позволено выносить телеметрию наружу.
+# Воркер и gateway пишут сюда по внутренней сети и адреса Tempo не знают.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      # SDK по умолчанию часто выбирают gRPC. Если появится такой сервис —
+      # раскомментируйте и опубликуйте 4317 в compose.
+      # grpc:
+      #   endpoint: 0.0.0.0:4317
+
+processors:
+  # Ограничение памяти обязательно: всплеск трассировок не должен вытеснить
+  # сервисы, ради наблюдения за которыми он и собирается.
+  # limit_mib должен быть ниже mem_limit контейнера (384m в compose).
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+# Метрики из трейсов считаются ЗДЕСЬ, а не генератором Tempo.
+#
+# У генератора в 3.0 модуль стартует, переопределения применяются, но в его
+# кольце нет участников — distributor не находит, кому отдавать спаны, и на
+# вход генератору не поступает ничего. Тот же симптом описан в grafana/tempo
+# issue #5479 и закрыт без решения.
+#
+# Коллектор и так стоит на пути всех трейсов, поэтому считать здесь дешевле,
+# чем чинить чужой компонент. Имена метрик совпадают с теми, что даёт
+# генератор, — дашборды и `serviceMap` в Grafana работают одинаково.
+connectors:
+  spanmetrics:
+    namespace: traces.span.metrics
+    histogram:
+      # Секунды, а не миллисекунды по умолчанию: так принято в Prometheus,
+      # и панели не приходится пересчитывать.
+      unit: s
+      explicit:
+        # Цель по времени до вердикта — p95 ≤ 0.7 с, поэтому корзины сгущены
+        # вокруг неё, а не оставлены по умолчанию.
+        buckets: [10ms, 50ms, 100ms, 250ms, 500ms, 700ms, 1s, 2s, 5s, 10s]
+    # Блока `dimensions` здесь нет намеренно: service.name, span.name,
+    # span.kind и status.code коннектор добавляет сам, и повторное
+    # перечисление — ошибка валидации, а не дубликат-без-последствий.
+    # Сюда добавляют только свои атрибуты — и по одному: каждое измерение
+    # умножает число временных рядов.
+
+  servicegraph:
+    latency_histogram_buckets: [10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s]
+    store:
+      # Сколько ждать парную сторону вызова. Мало — рёбра теряются, много —
+      # растёт память: незакрытые пары висят всё это время.
+      ttl: 10s
+      max_items: 10000
+
+exporters:
+  otlp/tempo:
+    endpoint: ${env:TEMPO_ENDPOINT}
+    tls:
+      insecure: true
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      queue_size: 1000
+
+  # Метрики из трейсов отдаются на скрейп отдельным портом, а не через
+  # remote_write: у Prometheus и так есть все цели рядом, а лишний путь
+  # доставки — лишнее место, где данные теряются молча.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Имена оставляем как есть: под них написаны дашборды.
+    namespace: ""
+    send_timestamps: true
+    resource_to_telemetry_conversion:
+      enabled: false
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      # Трейсы уходят и в хранилище, и в счётчики: коннектор это выход одного
+      # конвейера и вход другого.
+      exporters: [otlp/tempo, spanmetrics, servicegraph]
+
+    metrics/from-traces:
+      receivers: [spanmetrics, servicegraph]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      level: normal
+      readers:
+        - pull:
+            exporter:
+              prometheus:
+                host: 0.0.0.0
+                port: 8888

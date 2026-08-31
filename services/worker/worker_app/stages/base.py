@@ -72,6 +72,7 @@ class ScanContext:
         """Срез, которого достаточно для вердикта и для кэша."""
         return ScanFacts(
             findings=list(self.findings),
+            detected_mime=self.detected_mime,
             encrypted=self.encrypted,
             supported=self.supported,
             failed_stages=set(self.failed_stages),

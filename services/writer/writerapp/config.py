@@ -13,8 +13,15 @@ class WriterSettings(CommonSettings):
     results_stream: str = "scan.results"
     results_group: str = "writers"
 
-    batch_size: int = 64
+    batch_size: int = 32
     """Сколько результатов писать одной транзакцией."""
+
+    flush_interval_s: float = 2.0
+    """Как часто сбрасывать накопленное, даже если пачка не заполнилась.
+
+    Без этого история ждала бы 32 скана: при небольшом потоке она оставалась бы
+    невидимой часами, а ради неё сервис и существует.
+    """
 
     history_retention_days: int = 90
     """Срок хранения истории. Ноль — не удалять (нужно решать осознанно)."""

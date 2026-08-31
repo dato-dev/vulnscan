@@ -1,0 +1,20 @@
+# Автоматическая загрузка дашбордов в Grafana.
+#
+# Положите этот файл в provisioning/dashboards/ вашего стека мониторинга,
+# а каталог с JSON — туда, куда указывает `path`.
+apiVersion: 1
+
+providers:
+  - name: vulnscantg
+    orgId: 1
+    folder: vulnscantg
+    type: file
+    # Правки через интерфейс не переживут перезагрузку: дашборды лежат в
+    # репозитории, и менять их надо там. Иначе изменение живёт до первого
+    # перезапуска Grafana и теряется молча.
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards/vulnscantg
+      foldersFromFilesStructure: false

@@ -29,3 +29,13 @@ scrape_configs:
   - job_name: vulnscantg-bot
     static_configs:
       - targets: ["bot:9102"]
+
+  # Доставку результатов считает notifier, а не воркер: коллбэки уехали туда
+  # вместе с ключами тенантов. Без этой цели панель «Коллбэки» пуста всегда.
+  - job_name: vulnscantg-notifier
+    static_configs:
+      - targets: ["notifier:9103"]
+
+  - job_name: vulnscantg-writer
+    static_configs:
+      - targets: ["writer:9101"]

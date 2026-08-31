@@ -1,0 +1,46 @@
+# Демонстрационный сайт с формой обратной связи.
+#
+# Отдельный файл намеренно: это пример подключения, а не часть сервиса, и
+# в основном compose ему делать нечего — там он только мешал профилями.
+#
+#   docker compose -f docker-compose.yml up -d
+#
+# Требует, чтобы сканер уже работал: сайт подключается к его внутренней сети.
+
+name: vulnscan-demo
+
+services:
+  demo-site:
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-demo-site:${IMAGE_TAG:-latest}
+
+    # Собирается там, где есть репозиторий. На сервер едет образом: туда
+    # копируется только каталог deploy, исходников там нет.
+    build:
+      context: ../..
+      dockerfile: examples/feedback-site/Dockerfile
+
+    networks:
+      # Внутренняя сеть сканера: по ней сайт ходит к gateway.
+      vulnscan_backend:
+      # Нужна НЕ для связи наружу, а чтобы опубликовать порт: в сети с
+      # `internal: true` Docker публикацию не выполняет, причём молча —
+      # `ports` в файле есть, а отображения нет.
+      vulnscan_egress:
+
+    environment:
+      SCANNER_URL: http://gateway:8080
+      SCANNER_KEY_ID: ${DEMO_KEY_ID:?задайте DEMO_KEY_ID в .env}
+      SCANNER_SECRET: ${DEMO_SECRET:?задайте DEMO_SECRET в .env}
+
+    ports:
+      - "${DEMO_PORT:-8000}:8000"
+
+    restart: unless-stopped
+
+networks:
+  # Сети создаёт основной compose сканера, здесь только подключаемся.
+  # Имена — с префиксом проекта `vulnscan`.
+  vulnscan_backend:
+    external: true
+  vulnscan_egress:
+    external: true

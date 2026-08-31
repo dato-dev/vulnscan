@@ -15,7 +15,7 @@ from vscommon.keys import KeyRegistry
 from vscommon.ownership import Ownership
 from vscommon.policy import PolicyRegistry
 from vscommon.provisioning import TenantStore
-from vscommon.queue import DeadLetterQueue, JobQueue, ResultChannel
+from vscommon.queue import DeadLetterQueue, JobQueue, ResultChannel, ResultStream
 from vscommon.ratelimit import ConcurrencyLimiter, RateLimiter
 from vscommon.redis_client import create_redis
 from vscommon.shadow import ShadowLedger
@@ -31,6 +31,7 @@ class AppState:
     redis: Redis
     queue: JobQueue
     results: ResultChannel
+    history: ResultStream
     structural: StructuralCache
     av_cache: AvCache
     store: ObjectStore
@@ -113,6 +114,7 @@ async def build_state() -> AppState:
         redis=redis,
         queue=queue,
         results=ResultChannel(redis),
+        history=ResultStream(redis, settings.results_stream, settings.results_group),
         structural=StructuralCache(redis, settings.verdict_ttl_s),
         av_cache=AvCache(redis, settings.av_cache_ttl_s),
         store=store,

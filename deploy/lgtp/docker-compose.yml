@@ -1,0 +1,291 @@
+name: lgtp
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+
+  # ═══════════════════════════════════════════════════════════════════
+  # G — Grafana
+  # ═══════════════════════════════════════════════════════════════════
+
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION}
+    container_name: grafana
+    restart: unless-stopped
+
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD}
+      GF_USERS_DEFAULT_THEME: dark
+      GF_FEATURE_TOGGLES_ENABLE: traceQLStreaming,metricsSummary
+
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro,z
+
+    ports:
+      - "${GRAFANA_PORT}:3000"
+
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+    networks:
+      - lgtp
+
+    logging: *default-logging
+
+
+  # ═══════════════════════════════════════════════════════════════════
+  # L — Loki
+  # ═══════════════════════════════════════════════════════════════════
+
+  loki:
+    image: grafana/loki:${LOKI_VERSION}
+    container_name: loki
+    restart: unless-stopped
+
+    command:
+      - -config.file=/etc/loki/loki.yaml
+
+    volumes:
+      - ./loki/loki.yaml:/etc/loki/loki.yaml:ro,z
+      - loki-data:/loki
+
+    ports:
+      - "${LOKI_PORT}:3100"
+
+    networks:
+      - lgtp
+
+    logging: *default-logging
+
+
+  # ═══════════════════════════════════════════════════════════════════
+  # T — Tempo
+  # ═══════════════════════════════════════════════════════════════════
+
+  tempo:
+    image: grafana/tempo:${TEMPO_VERSION}
+    container_name: tempo
+    restart: unless-stopped
+
+    command:
+      - -config.file=/etc/tempo/tempo.yaml
+
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro,z
+      - ./tempo/data:/var/tempo:z
+
+    # HTTP API / TraceQL.
+    #
+    # OTLP/GRPC 4317 наружу НЕ публикуем.
+    # OTel Collector обращается к:
+    #
+    #   tempo:4317
+    #
+    # внутри сети lgtp.
+
+    ports:
+      - "${TEMPO_PORT}:3200"
+
+    depends_on:
+      - prometheus
+
+    networks:
+      - lgtp
+
+    logging: *default-logging
+
+
+  # ═══════════════════════════════════════════════════════════════════
+  # P — Prometheus
+  # ═══════════════════════════════════════════════════════════════════
+
+  prometheus:
+    image: prom/prometheus:${PROMETHEUS_VERSION}
+    container_name: prometheus
+    restart: unless-stopped
+
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROM_RETENTION}
+      - --web.enable-lifecycle
+      - --web.enable-remote-write-receiver
+      - --web.external-url=http://localhost:${PROMETHEUS_PORT}
+
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro,z
+      - ./prometheus/rules:/etc/prometheus/rules:ro,z
+      - prometheus-data:/prometheus
+
+    ports:
+      - "${PROMETHEUS_PORT}:9090"
+
+    depends_on:
+      - alertmanager
+
+    networks:
+      - lgtp
+
+    logging: *default-logging
+
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Alertmanager
+  # ═══════════════════════════════════════════════════════════════════
+
+  alertmanager:
+    image: prom/alertmanager:${ALERTMANAGER_VERSION}
+    container_name: alertmanager
+    restart: unless-stopped
+
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.external-url=http://localhost:${ALERTMANAGER_PORT}
+
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro,z
+      - alertmanager-data:/alertmanager
+
+    ports:
+      - "${ALERTMANAGER_PORT}:9093"
+
+    networks:
+      - lgtp
+
+    logging: *default-logging
+
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Alloy
+  #
+  # Docker logs → Loki.
+  #
+  # Alloy НЕ является OTLP endpoint.
+  # ═══════════════════════════════════════════════════════════════════
+
+  alloy:
+    image: grafana/alloy:${ALLOY_VERSION}
+    container_name: alloy
+    restart: unless-stopped
+
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro,z
+      - alloy-data:/var/lib/alloy/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    ports:
+      - "${ALLOY_PORT}:12345"
+
+    depends_on:
+      - loki
+
+    networks:
+      - lgtp
+
+    logging: *default-logging
+
+
+  # ═══════════════════════════════════════════════════════════════════
+  # OTel Collector
+  #
+  # Единственная точка входа для OTLP от приложений.
+  #
+  # Application:
+  #
+  #   http://otel-collector:4318/v1/traces
+  #
+  # Collector → Tempo:
+  #
+  #   tempo:4317
+  # ═══════════════════════════════════════════════════════════════════
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:${OTELCOL_VERSION}
+    container_name: otel-collector
+    restart: unless-stopped
+
+    command:
+      - --config=/etc/otelcol/config.yaml
+
+    environment:
+      TEMPO_ENDPOINT: tempo:4317
+
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol/config.yaml:ro,z
+
+    ports:
+      - "${OTEL_HTTP_PORT}:4318"
+      # Метрики из трейсов. Наружу можно не публиковать — Prometheus рядом
+      # в той же сети; строка оставлена для отладки с самого хоста.
+      # - "8889:8889"
+
+    mem_limit: 384m
+
+    depends_on:
+      - tempo
+
+    networks:
+      - lgtp
+
+    logging: *default-logging
+
+
+  # ═══════════════════════════════════════════════════════════════════
+  # Node Exporter
+  # ═══════════════════════════════════════════════════════════════════
+
+  node-exporter:
+    image: prom/node-exporter:${NODE_EXPORTER_VERSION}
+    container_name: node-exporter
+    restart: unless-stopped
+
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+
+    pid: host
+
+    volumes:
+      - /:/host:ro,rslave
+
+    networks:
+      - lgtp
+
+    logging: *default-logging
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Volumes
+# ═══════════════════════════════════════════════════════════════════
+
+volumes:
+  grafana-data:
+  prometheus-data:
+  alertmanager-data:
+  loki-data:
+  alloy-data:
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Network
+# ═══════════════════════════════════════════════════════════════════
+
+networks:
+  lgtp:
+    name: lgtp
+    driver: bridge

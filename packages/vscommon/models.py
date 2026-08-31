@@ -189,6 +189,15 @@ class ScanFacts(BaseModel):
     """
 
     findings: list[Finding] = Field(default_factory=list)
+
+    detected_mime: str | None = None
+    """Тип, определённый по содержимому, а не по расширению.
+
+    Факт о файле, а не о запросе: заявленный клиентом тип сюда не попадает.
+    Кэшируется вместе с остальными признаками — иначе ответ из кэша не знал бы
+    типа, хотя определялся он по тому же содержимому.
+    """
+
     encrypted: bool = False
     supported: bool = True
     failed_stages: set[str] = Field(default_factory=set)
@@ -198,6 +207,8 @@ class ScanFacts(BaseModel):
         seen = {f.code for f in self.findings}
         return ScanFacts(
             findings=self.findings + [f for f in other.findings if f.code not in seen],
+            # Тип определяет структурная часть; у антивирусной его нет.
+            detected_mime=self.detected_mime or other.detected_mime,
             encrypted=self.encrypted or other.encrypted,
             supported=self.supported and other.supported,
             failed_stages=self.failed_stages | other.failed_stages,

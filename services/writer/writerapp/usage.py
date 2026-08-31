@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from vscommon.logging import setup_logging
 
@@ -53,27 +53,39 @@ ORDER BY 1, 2
 """
 
 
+@dataclass
+class _Accumulator:
+    """Накопитель по одному тенанту.
+
+    Типизированный, а не `dict[str, object]`: со словарём каждая арифметика
+    требовала подавления проверки типов, и ошибка в ней прошла бы незамеченной.
+    """
+
+    scans: int = 0
+    total_ms: int = 0
+    bytes_scanned: int = 0
+    verdicts: dict[str, int] = field(default_factory=dict)
+
+
 async def collect(db: Database, days: int, tenant: str | None) -> list[TenantUsage]:
     async with db.pool.acquire() as conn:
         rows = await conn.fetch(USAGE_SQL, days, tenant)
 
-    grouped: dict[str, dict[str, object]] = {}
+    grouped: dict[str, _Accumulator] = {}
     for row in rows:
-        entry = grouped.setdefault(
-            row["tenant"], {"verdicts": {}, "scans": 0, "total_ms": 0, "bytes": 0}
-        )
-        entry["verdicts"][row["verdict"]] = row["scans"]  # type: ignore[index]
-        entry["scans"] = int(entry["scans"]) + row["scans"]  # type: ignore[arg-type]
-        entry["total_ms"] = int(entry["total_ms"]) + row["total_ms"]  # type: ignore[arg-type]
-        entry["bytes"] = int(entry["bytes"]) + row["bytes_scanned"]  # type: ignore[arg-type]
+        entry = grouped.setdefault(row["tenant"], _Accumulator())
+        entry.verdicts[row["verdict"]] = row["scans"]
+        entry.scans += row["scans"]
+        entry.total_ms += row["total_ms"]
+        entry.bytes_scanned += row["bytes_scanned"]
 
     return [
         TenantUsage(
             tenant=name,
-            scans=int(data["scans"]),  # type: ignore[arg-type]
-            verdicts=dict(data["verdicts"]),  # type: ignore[arg-type]
-            total_ms=int(data["total_ms"]),  # type: ignore[arg-type]
-            bytes_scanned=int(data["bytes"]),  # type: ignore[arg-type]
+            scans=data.scans,
+            verdicts=dict(data.verdicts),
+            total_ms=data.total_ms,
+            bytes_scanned=data.bytes_scanned,
         )
         for name, data in sorted(grouped.items())
     ]

@@ -15,6 +15,10 @@ class CommonSettings(BaseSettings):
     jobs_stream: str = "scan.jobs"
     jobs_group: str = "scanners"
     deep_stream: str = "scan.deep"
+    results_stream: str = "scan.results"
+    results_group: str = "writers"
+    """Поток истории. Пишут в него gateway и воркер, читает Result Writer."""
+
     dlq_stream: str = "scan.dlq"
     dlq_maxlen: int = 10_000
 
