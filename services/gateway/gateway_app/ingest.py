@@ -25,7 +25,7 @@ from vscommon.models import (
     Verdict,
 )
 from vscommon.policy import upload_limit_for
-from vscommon.telemetry import current_traceparent, span
+from vscommon.telemetry import continue_trace, current_traceparent
 
 from .cache_probe import CacheProbe
 from .config import settings
@@ -61,7 +61,11 @@ class Ingestor:
         self._state = state
 
     async def ingest_upload(
-        self, upload, request: ScanRequest, idempotency_key: str | None = None
+        self,
+        upload,
+        request: ScanRequest,
+        idempotency_key: str | None = None,
+        traceparent: str | None = None,
     ) -> tuple[ScanResult, bool]:
         """Приём multipart-файла. Возвращает (результат, синхронный_ли_ответ)."""
         policy = self._state.policies.for_tenant(request.tenant)
@@ -97,9 +101,13 @@ class Ingestor:
                 request.declared_mime or "application/octet-stream",
             )
         ref.size = hasher.size
-        return await self._dispatch(sha256, ref, hasher.size, request, probe.structural)
+        return await self._dispatch(
+            sha256, ref, hasher.size, request, probe.structural, traceparent
+        )
 
-    async def ingest_ref(self, request: ScanRequest) -> tuple[ScanResult, bool]:
+    async def ingest_ref(
+        self, request: ScanRequest, traceparent: str | None = None
+    ) -> tuple[ScanResult, bool]:
         """Приём файла по ссылке — файл уже лежит в общем хранилище."""
         if request.source is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "не задан source")
@@ -109,7 +117,11 @@ class Ingestor:
         # sha256 по ссылке считает воркер: gateway не тянет тело ради хэша.
         pseudo = f"ref:{request.source.bucket}/{request.source.key}"
         return await self._dispatch(
-            sha256=pseudo, ref=request.source, size=request.source.size or 0, request=request
+            sha256=pseudo,
+            ref=request.source,
+            size=request.source.size or 0,
+            request=request,
+            traceparent=traceparent,
         )
 
     def _resolve_profile(self, request: ScanRequest) -> str:
@@ -189,6 +201,7 @@ class Ingestor:
         profile: str,
         cached: CachedStructural | None,
         elapsed_s: float,
+        size: int = 0,
     ) -> None:
         """Время до вердикта, а не латентность API.
 
@@ -205,6 +218,9 @@ class Ingestor:
         current.verdict_seconds.labels(
             profile=profile, cached=str(cached is not None).lower()
         ).observe(elapsed_s)
+        # Рядом со временем и в том же месте: разъехавшись, они перестают
+        # отвечать на вопрос «стало медленнее или стало тяжелее».
+        current.input_bytes.labels(profile=profile).observe(size)
 
     async def _record_history(self, result: ScanResult, request: ScanRequest, size: int) -> None:
         """Отправляет запись в поток истории.
@@ -233,6 +249,7 @@ class Ingestor:
         size: int,
         request: ScanRequest,
         cached: CachedStructural | None = None,
+        traceparent: str | None = None,
     ) -> tuple[ScanResult, bool]:
         ext = PurePosixPath(request.filename).suffix.lower()[:16] if request.filename else None
 
@@ -265,9 +282,15 @@ class Ingestor:
 
         with (
             log_context(scan_id=scan_id, sha=short(sha256), tenant=request.tenant),
-            # Корневой спан скана. Имя файла и полный sha256 в атрибуты не идут:
-            # спан уезжает наружу и живёт там дольше лога.
-            span(
+            # Спан приёма. Корневым он становится только тогда, когда клиент
+            # не прислал контекст: у бота и у SDK трейс начинается раньше, на
+            # их стороне, и без продолжения дерево рвалось бы на HTTP-границе —
+            # через очередь мы контекст протаскиваем, а через HTTP не
+            # протаскивали вовсе.
+            #
+            # Негодный заголовок не принимается: начнётся новый корень.
+            continue_trace(
+                traceparent,
                 "scan.accept",
                 scan_id=scan_id,
                 tenant=tenant_label(request.tenant),
@@ -325,7 +348,7 @@ class Ingestor:
                     "синхронный ответ",
                     extra={"elapsed_ms": int(elapsed_s * 1000), "duplicate": duplicate},
                 )
-                self._observe_verdict(result, request, profile.value, cached, elapsed_s)
+                self._observe_verdict(result, request, profile.value, cached, elapsed_s, size)
                 return result, True
 
             logger.debug("дедлайн синхронного ответа истёк, уходим в коллбэк")

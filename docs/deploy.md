@@ -67,7 +67,6 @@ docker compose pull && docker compose up -d
 ### Необязательные профили
 
 ```bash
-docker compose --profile observability up -d   # мост телеметрии и Prometheus
 docker compose --profile public up -d          # точка входа с TLS
 ```
 

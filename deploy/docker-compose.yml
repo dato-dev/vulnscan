@@ -41,9 +41,12 @@ services:
     # файлы, дыра в парсере превращается из «упал контейнер» в «есть канал
     # наружу». Ровно от этого его и держали в `internal: true`.
     #
-    # Вернуть изоляцию: убрать отсюда `lgtp`, поднять мост профилем
-    # `observability` и указать воркерам OTEL_ENDPOINT=http://vs-collector:4318/v1/traces
-    # `deploy/isolation-check.sh` будет падать, пока это здесь.
+    # Вернуть изоляцию: убрать отсюда `lgtp` и поднять внутри `backend`
+    # собственный коллектор, который вынесет телеметрию наружу. Такой мост
+    # здесь был (профиль `observability`) и убран как неиспользуемый —
+    # конфигурация лишнего сервиса устаревает молча, а нужен он станет не
+    # раньше возврата изоляции.
+    # `deploy/isolation-check.sh` будет падать, пока `lgtp` здесь.
     networks: [backend, lgtp]
     # Ядерная изоляция разбора недоверенных файлов включается отдельным файлом:
     #   docker compose -f docker-compose.yml -f docker-compose.gvisor.yml up -d
@@ -52,6 +55,7 @@ services:
     image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-worker:${IMAGE_TAG:-latest}
     env_file: [.env]
     environment:
+      METRICS_PORT: "9100"
       PYTHONPATH: /app
       POLICY_FILE: /app/config/policies.json
       WEIGHTS_FILE: /app/config/weights.json
@@ -83,13 +87,17 @@ services:
     # файлы, дыра в парсере превращается из «упал контейнер» в «есть канал
     # наружу». Ровно от этого его и держали в `internal: true`.
     #
-    # Вернуть изоляцию: убрать отсюда `lgtp`, поднять мост профилем
-    # `observability` и указать воркерам OTEL_ENDPOINT=http://vs-collector:4318/v1/traces
-    # `deploy/isolation-check.sh` будет падать, пока это здесь.
+    # Вернуть изоляцию: убрать отсюда `lgtp` и поднять внутри `backend`
+    # собственный коллектор, который вынесет телеметрию наружу. Такой мост
+    # здесь был (профиль `observability`) и убран как неиспользуемый —
+    # конфигурация лишнего сервиса устаревает молча, а нужен он станет не
+    # раньше возврата изоляции.
+    # `deploy/isolation-check.sh` будет падать, пока `lgtp` здесь.
     networks: [backend, lgtp]
     image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-worker:${IMAGE_TAG:-latest}
     env_file: [.env]
     environment:
+      METRICS_PORT: "9100"
       PYTHONPATH: /app
       WORKER_MODE: deep
       CONSUMER_NAME: deep-1
@@ -156,28 +164,6 @@ services:
   # Так воркер остаётся без выхода в интернет — это и есть смысл конструкции:
   # подключать сам воркер к сети мониторинга нельзя, она обычная bridge с
   # доступом наружу, и изоляция разбора враждебных файлов на этом кончится.
-  # Мост наружу. Сейчас НЕ используется: сервисы подключены к сети мониторинга
-  # напрямую. Нужен, когда воркеру вернут изоляцию — тогда он единственный
-  # ходит в `lgtp`, а воркер остаётся в `internal: true`.
-  vs-collector:
-    networks:
-      backend:
-        ipv4_address: 172.20.0.14
-      # Сеть общего стека мониторинга. Только этот сервис в ней и состоит:
-      # она обычная bridge с выходом наружу, и воркеру там делать нечего.
-      lgtp:
-    image: otel/opentelemetry-collector-contrib:0.115.1
-    command: ["--config=/vsconfig/otel-collector.yaml"]
-    # Монтируется КАТАЛОГ в нейтральную точку, а не отдельные файлы в места,
-    # принадлежащие образу. Отсутствующий файл Docker молча создаёт каталогом,
-    # и контейнер падает с «not a directory» — так уже трижды не поднимался
-    # стек. С каталогом этого класса ошибок нет: нет файла — сервис скажет об
-    # этом сам и своими словами.
-    volumes:
-      - ./config:/vsconfig:ro
-    restart: unless-stopped
-    profiles: ["observability"]
-
   # Точка входа для внешних клиентов. Поднимается профилем `public`.
   #
   #   docker compose --profile public up -d
@@ -268,32 +254,6 @@ services:
       - postgres-data:/var/lib/postgresql/data
     restart: unless-stopped
 
-  # Метрики. Имя своё по той же причине, что и у моста: в общем стеке уже есть
-  # контейнер `prometheus`, а Compose вешает имя сервиса алиасом на каждую сеть.
-  #
-  # Живёт в `backend`, потому что цели там: Prometheus общего стека до сервисов
-  # во внутренней сети не дотянется. Отдавать данные наружу — через
-  # `remote_write` в config/prometheus.yml, а не подключением сервисов к нему.
-  vs-prometheus:
-    networks:
-      backend:
-      lgtp:
-    image: prom/prometheus:v3.1.0
-    command:
-      - --config.file=/vsconfig/prometheus.yml
-      - --storage.tsdb.retention.time=15d
-    # Монтируется КАТАЛОГ в нейтральную точку, а не отдельные файлы в места,
-    # принадлежащие образу. Отсутствующий файл Docker молча создаёт каталогом,
-    # и контейнер падает с «not a directory» — так уже трижды не поднимался
-    # стек. С каталогом этого класса ошибок нет: нет файла — сервис скажет об
-    # этом сам и своими словами.
-    volumes:
-      - ./config:/vsconfig:ro
-      - prometheus-data:/prometheus
-    expose: ["9090"]
-    restart: unless-stopped
-    profiles: ["observability"]
-
   clamd:
     # Выхода наружу больше НЕТ: за базами ходит только cvdmirror, а clamd берёт
     # их у него по внутренней сети. Раньше clamd стоял в `egress` ради
@@ -339,6 +299,8 @@ services:
     environment:
       CVD_DB_DIR: /db
       CVD_PORT: "8000"
+      # Явно, как всем: умолчание из кода перебивается общим .env (M10.9).
+      METRICS_PORT: "9104"
       # Раз в четыре часа. ClamAV просит не чаще раза в час; у нас с запасом.
       CVD_UPDATE_INTERVAL_S: ${CVD_UPDATE_INTERVAL_S:-14400}
       # Резолвер задаётся явно: cvdupdate сам спрашивает TXT-запись, чтобы
@@ -347,7 +309,7 @@ services:
       CVD_NAMESERVER: ${CVD_NAMESERVER:-1.1.1.1}
     volumes:
       - cvd-db:/db
-    expose: ["8000"]
+    expose: ["8000", "9104"]
     restart: unless-stopped
 
   redis:
@@ -414,9 +376,10 @@ networks:
       config:
         - subnet: 172.20.0.0/16
 
-  # Сеть общего стека мониторинга (Grafana/Tempo/Loki). Создаётся его compose,
-  # здесь только подключаемся. Нет такого стека — удалите `lgtp` у vs-collector
-  # и vs-prometheus и верните им `egress`.
+  # Сеть общего стека мониторинга (Grafana/Tempo/Loki). Создаётся его compose
+  # в `deploy/lgtp`, здесь только подключаемся. Нет такого стека — сервисы не
+  # поднимутся: сеть объявлена внешней намеренно, чтобы отсутствие стека было
+  # ошибкой на старте, а не молча пропавшей телеметрией.
   lgtp:
     external: true
     name: lgtp
@@ -430,7 +393,6 @@ volumes:
   caddy-data:
   caddy-config:
   postgres-data:
-  prometheus-data:
   redis-data:
   cvd-db:
   clamav-db:

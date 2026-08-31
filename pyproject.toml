@@ -20,10 +20,14 @@ dependencies = [
     "yara-python>=4.5",
     # Телеметрия. Сервис обязан работать и без неё: отсутствующий SDK
     # выключает трассировку и метрики, но не проверку файлов.
-    "opentelemetry-api>=1.29",
-    "opentelemetry-sdk>=1.29",
-    "opentelemetry-exporter-otlp-proto-http>=1.29",
-    "prometheus-client>=0.21",
+    # Точные версии, а не границы: то же, что в deploy/requirements-telemetry.txt.
+    # Разъехавшись, локальные тесты и образ проверяли бы разный код SDK, а
+    # расхождение версий телеметрии проявляется не ошибкой, а изменившимися
+    # именами атрибутов. Совпадение проверяется тестом.
+    "opentelemetry-api==1.44.0",
+    "opentelemetry-sdk==1.44.0",
+    "opentelemetry-exporter-otlp-proto-http==1.44.0",
+    "prometheus-client==0.26.0",
     # История проверок. Доступ к БД есть только у Result Writer.
     "asyncpg>=0.30",
 ]
@@ -69,6 +73,8 @@ ignore = [
 "samples/*" = ["T20"]
 "bench/*" = ["T20", "E402"]
 "docs/*" = ["T20", "E402"]
+# Генератор дашбордов: его вывод — путь записанного файла, а не лог сервиса.
+"deploy/grafana/*" = ["T20"]
 "corpus/*" = ["T20", "E402", "S310"]  # печать отчёта и загрузка по фиксированному URL   # печать результатов и импорт после sys.path
 "packages/vscommon/config.py" = ["S105"]
 "services/bot/botapp/config.py" = ["S105"]  # дефолт-заглушка, значение из env   # дефолты-заглушки, реальные значения из env

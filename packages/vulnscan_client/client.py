@@ -7,6 +7,7 @@ import hmac
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -121,6 +122,7 @@ class VulnscanClient:
         wait_ms: int = 2000,
         callback_url: str | None = None,
         retries: int = 3,
+        trace_context: Callable[[], str | None] | None = None,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._key_id = key_id
@@ -128,6 +130,7 @@ class VulnscanClient:
         self._wait_ms = wait_ms
         self._callback_url = callback_url
         self._retries = retries
+        self._trace_context = trace_context
         self._http = httpx.AsyncClient(timeout=timeout_s)
 
     async def __aenter__(self) -> VulnscanClient:
@@ -141,11 +144,24 @@ class VulnscanClient:
 
     def _headers(self, payload: bytes) -> dict[str, str]:
         timestamp, signature = _sign(self._secret, payload)
-        return {
+        headers = {
             KEY_ID_HEADER: self._key_id,
             TIMESTAMP_HEADER: timestamp,
             SIGNATURE_HEADER: signature,
         }
+        # Контекст трассировки, если вызывающая сторона его ведёт. Библиотека
+        # не зависит от OpenTelemetry намеренно: подключающейся команде не
+        # должно навязываться ничего, кроме httpx. Поэтому не импорт, а
+        # функция, которую передают снаружи.
+        #
+        # На подпись это не влияет: подписывается канонический запрос
+        # (метод, путь, идентификатор ключа) либо тело, а заголовки в неё не
+        # входят. Иначе добавление заголовка ломало бы совместимость.
+        if self._trace_context is not None:
+            traceparent = self._trace_context()
+            if traceparent:
+                headers["traceparent"] = traceparent
+        return headers
 
     async def scan(
         self,

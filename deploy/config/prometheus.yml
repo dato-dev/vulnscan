@@ -39,3 +39,9 @@ scrape_configs:
   - job_name: vulnscantg-writer
     static_configs:
       - targets: ["writer:9101"]
+
+  # Зеркало баз ClamAV. Единственный компонент, ходящий наружу, и единственный,
+  # чей отказ ничем себя не проявляет: раздача продолжается, базы стареют.
+  - job_name: vulnscantg-cvdmirror
+    static_configs:
+      - targets: ["cvdmirror:9104"]

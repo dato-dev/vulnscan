@@ -1,0 +1,96 @@
+# Правила о самом стеке наблюдения.
+#
+# Отдельный файл, потому что предмет другой: `vulnscantg.yml` следит за
+# сервисом, этот — за тем, чем мы за сервисом следим. Пока эти правила молчат,
+# молчанию остальных можно верить.
+#
+# Два имени здесь английские — `Watchdog` и `TargetDown`. На них ссылается
+# маршрутизация в `alertmanager/alertmanager.yml`: правило `blackhole` для
+# первого и подавление по второму. Переименуешь — совпадение исчезнет молча.
+
+groups:
+  - name: alerting-path
+    interval: 30s
+    rules:
+      # Единственное правило, которое обязано гореть всегда.
+      #
+      # Оно ничего не измеряет: оно доказывает, что путь «правило → Prometheus
+      # → Alertmanager → канал» жив. Молчащий Alertmanager неотличим от
+      # спокойной системы, и отличить их можно только тем, что должно шуметь.
+      # Уходит в blackhole, а на той стороне ожидается снаружи — Dead Man's
+      # Snitch или его аналог.
+      - alert: Watchdog
+        expr: vector(1)
+        for: 0m
+        labels: {severity: none}
+        annotations:
+          summary: "Путь доставки алертов жив"
+          description: >-
+            Всегда активен. Его исчезновение означает, что сломался сам
+            механизм оповещения, а не наблюдаемая система.
+
+      - alert: ПравилаНеВычисляются
+        expr: increase(prometheus_rule_evaluation_failures_total[10m]) > 0
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "Prometheus не может вычислить правила"
+          description: >-
+            Правило с ошибкой не срабатывает никогда. Внешне это неотличимо от
+            благополучия: график ровный, потому что проверки нет.
+
+      - alert: АлертыНеДоходят
+        expr: increase(alertmanager_notifications_failed_total[15m]) > 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "Alertmanager не доставляет оповещения"
+          description: >-
+            Алерты сработали и остались внутри. В интерфейсе они видны, до
+            дежурного не дошли.
+
+      - alert: PrometheusТеряетАлерты
+        expr: increase(prometheus_notifications_dropped_total[15m]) > 0
+        for: 15m
+        labels: {severity: critical}
+        annotations:
+          summary: "Prometheus отбрасывает алерты по пути к Alertmanager"
+          description: >-
+            Обрыв на участке между тем, кто сработал, и тем, кто рассылает.
+
+  - name: stack-health
+    interval: 30s
+    rules:
+      # Сервисы vulnscantg покрыты отдельным правилом в vulnscantg.yml: там
+      # выше severity и короче ожидание. Здесь — всё остальное, чего до сих
+      # пор не покрывал никто.
+      - alert: TargetDown
+        expr: up{job!~"vulnscantg.*"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Цель {{ $labels.job }} не отвечает"
+          description: >-
+            Prometheus не может снять метрики. Панели по этой цели покажут не
+            ошибку, а пустоту — и это будет выглядеть как отсутствие событий.
+
+      - alert: МетрикиИзТрейсовПропали
+        expr: absent_over_time(traces_span_metrics_calls_total[15m]) == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Коллектор перестал считать метрики из трейсов"
+          description: >-
+            Граф сервисов и «p95 по спанам» опустеют. Именно так выглядел
+            сломанный генератор Tempo, ради обхода которого счёт переехал в
+            коллектор: всё запущено, ошибок нет, данных нет.
+
+      - alert: ЛогиНеПоступают
+        expr: absent_over_time(up{job="loki"}[15m]) == 1
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "Loki выпал из наблюдения"
+          description: >-
+            Отсутствие самой метрики `up`, а не её ноль: задание исчезло из
+            конфигурации. Цели уже пропадали так — при правке файла.

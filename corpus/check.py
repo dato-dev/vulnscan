@@ -31,6 +31,7 @@ from app.scoring import verdict_of
 from app.stages.base import ScanContext
 from app.stages.filetype import FiletypeStage
 from app.stages.structure import StructureStage
+
 from vscommon.logging import setup_logging
 from vscommon.models import ObjectRef, ScanJob, TenantPolicy
 from vscommon.weights import WeightTable

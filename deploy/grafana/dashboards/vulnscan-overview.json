@@ -89,7 +89,8 @@
           },
           "color": {
             "mode": "thresholds"
-          }
+          },
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -146,7 +147,8 @@
           },
           "color": {
             "mode": "thresholds"
-          }
+          },
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -203,7 +205,8 @@
           },
           "color": {
             "mode": "thresholds"
-          }
+          },
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -243,7 +246,9 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
+        },
         "overrides": []
       },
       "options": {
@@ -313,7 +318,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s"
+          "unit": "s",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -363,7 +369,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -416,7 +423,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -456,7 +464,9 @@
         }
       ],
       "fieldConfig": {
-        "defaults": {},
+        "defaults": {
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
+        },
         "overrides": []
       },
       "options": {
@@ -496,7 +506,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -549,7 +560,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -590,7 +602,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },

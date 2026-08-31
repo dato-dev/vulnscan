@@ -6,8 +6,13 @@
 # выходе в интернет: наружу ходит только этот контейнер.
 FROM python:3.12-alpine
 
+COPY requirements-metrics.txt /tmp/requirements-metrics.txt
+
+# `cvdupdate` тянется отдельно: он не про наблюдаемость, а prometheus-client
+# берётся из общего файла, чтобы версия совпадала с остальными образами.
 RUN adduser -D -u 10001 cvd \
     && pip install --no-cache-dir "cvdupdate>=1.1" \
+    && pip install --no-cache-dir -r /tmp/requirements-metrics.txt \
     && mkdir -p /db \
     && chown -R cvd:cvd /db
 
@@ -17,10 +22,11 @@ RUN adduser -D -u 10001 cvd \
 VOLUME ["/db"]
 
 COPY services/cvdmirror/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY services/cvdmirror/exporter.py /usr/local/bin/exporter.py
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER cvd
 WORKDIR /db
-EXPOSE 8000
+EXPOSE 8000 9104
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

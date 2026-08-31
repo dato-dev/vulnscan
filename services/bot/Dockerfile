@@ -4,9 +4,13 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 RUN pip install --no-cache-dir "pydantic>=2.9" "pydantic-settings>=2.6" "httpx>=0.28" \
-    "fastapi>=0.115" "uvicorn[standard]>=0.32" \
-    "opentelemetry-api>=1.29" "opentelemetry-sdk>=1.29" \
-    "opentelemetry-exporter-otlp-proto-http>=1.29" "prometheus-client>=0.21"
+    "fastapi>=0.115" "uvicorn[standard]>=0.32"
+
+# Версии SDK наблюдаемости — из одного файла на все образы. Через `>=` каждая
+# пересборка могла принести другую версию, а какая работает на стенде —
+# выяснялось бы только изнутри контейнера.
+COPY requirements-telemetry.txt requirements-metrics.txt ./
+RUN pip install --no-cache-dir -r requirements-telemetry.txt
 
 COPY packages/vscommon /app/vscommon
 COPY services/bot/botapp /app/botapp

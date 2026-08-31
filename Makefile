@@ -94,6 +94,20 @@ fmt:  ## Форматирование
 typecheck:  ## Проверка типов
 	$(PY) -m mypy packages services
 
+check-stack:  ## Проверить конфигурацию мониторинга (нужен Docker)
+	@# M10.5: до выката, а не по логам упавшего контейнера. Коллектор уже
+	@# падал на `duplicate dimension name`, и узнали мы это с сервера.
+	@# Монтируем туда же, куда в проде: `rule_files` в конфигурации задан
+	@# абсолютным путём и по-другому не разрешится.
+	docker run --rm -v $(PWD)/deploy/lgtp/prometheus:/etc/prometheus:ro \
+		prom/prometheus:v3.13.0 promtool check config /etc/prometheus/prometheus.yml
+	docker run --rm -v $(PWD)/deploy/lgtp/prometheus/rules:/r:ro \
+		prom/prometheus:v3.13.0 promtool check rules /r/vulnscantg.yml
+	docker run --rm -v $(PWD)/deploy/lgtp/otel-collector:/c:ro \
+		otel/opentelemetry-collector-contrib:0.157.0 validate --config=/c/config.yaml
+	docker run --rm -v $(PWD)/deploy/lgtp/alertmanager:/a:ro \
+		prom/alertmanager:v0.30.1 amtool check-config /a/alertmanager.yml
+
 findings-doc:  ## Пересобрать справочник признаков
 	$(PY) docs/generate_findings.py
 

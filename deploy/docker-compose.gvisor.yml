@@ -22,7 +22,6 @@ x-sandbox-hosts: &sandbox-hosts
   - "minio:172.20.0.11"
   - "clamd:172.20.0.12"
   - "bot:172.20.0.13"
-  - "vs-collector:172.20.0.14"
   - "cvdmirror:172.20.0.15"
 
 services:

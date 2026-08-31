@@ -8,9 +8,13 @@ COPY pyproject.toml ./
 RUN pip install --no-cache-dir \
     "fastapi>=0.115" "uvicorn[standard]>=0.32" "pydantic>=2.9" \
     "pydantic-settings>=2.6" "redis>=5.2" "httpx>=0.28" \
-    "python-multipart>=0.0.12" "boto3>=1.35" \
-    "opentelemetry-api>=1.29" "opentelemetry-sdk>=1.29" \
-    "opentelemetry-exporter-otlp-proto-http>=1.29" "prometheus-client>=0.21"
+    "python-multipart>=0.0.12" "boto3>=1.35"
+
+# Версии SDK наблюдаемости — из одного файла на все образы. Через `>=` каждая
+# пересборка могла принести другую версию, а какая работает на стенде —
+# выяснялось бы только изнутри контейнера.
+COPY requirements-telemetry.txt requirements-metrics.txt ./
+RUN pip install --no-cache-dir -r requirements-telemetry.txt
 
 COPY packages/vscommon /app/vscommon
 COPY services/gateway/gateway_app /app/gateway_app

@@ -38,26 +38,30 @@ def _expression(target: dict[str, object]) -> str:
 
 
 def _exposed_metrics() -> set[str]:
-    """Имена, которые реально появляются в /metrics."""
+    """Имена, которые реально появляются в /metrics.
+
+    Наблюдения делаются перебором по реестру, а не списком вручную: список
+    приходилось дописывать на каждую новую метрику, и забытая строка означала
+    бы, что панель по свежей метрике не проходит проверку — то есть проверка
+    начинала бы мешать вместо того, чтобы помогать.
+    """
     from vscommon.metrics import metrics, render, setup_metrics
 
     setup_metrics(known_tenants=("t",))
-    m = metrics()
-    # Метрику видно в выводе только после первого наблюдения.
-    m.scans.labels(verdict="clean", tenant="t", mode="both").inc()
-    m.observe_stage("clamav", 0.1, ok=True)
-    m.observe_cache("av", hit=True)
-    m.verdict_seconds.labels(profile="standard", cached="false").observe(1.0)
-    m.cdr_seconds.labels(profile="strict", ok="true").observe(0.5)
-    m.stage_failures.labels(stage="yara", reason="timeout").inc()
-    m.http_requests.labels(method="POST", route="/v1/scan", status="200").inc()
-    m.http_seconds.labels(method="POST", route="/v1/scan").observe(1.0)
-    m.callbacks.labels(outcome="delivered").inc()
-    m.deliveries.labels(source="вебхук", verdict="clean").inc()
-    m.queue_depth.labels(stream="scan.jobs").set(0)
-    m.rules_age.labels(kind="av_db").set(0)
-    m.dlq_size.set(0)
-    m.inflight.set(0)
+    current = metrics()
+
+    # Метрику видно в выводе только после первого наблюдения: пока у неё нет
+    # ни одного ряда, prometheus_client не печатает ничего, кроме HELP/TYPE.
+    for attr, obj in vars(current).items():
+        if attr == "registry":
+            continue
+        target = obj.labels(**dict.fromkeys(obj._labelnames, "x")) if obj._labelnames else obj
+        if obj._type == "counter":
+            target.inc()
+        elif obj._type == "gauge":
+            target.set(0)
+        else:
+            target.observe(0.0)
 
     body, _ = render()
     return {
@@ -194,15 +198,24 @@ def test_metrics_ports_match_scrape_targets() -> None:
     targets = _scrape_targets()
 
     mismatched: dict[str, tuple[str, str]] = {}
+    silent: list[str] = []
     for name, port in targets.items():
         svc = services.get(name)  # type: ignore[union-attr]
         if svc is None or name == "gateway":
             # gateway отдаёт /metrics своим HTTP-портом, отдельного нет.
             continue
         declared = str((svc.get("environment") or {}).get("METRICS_PORT", ""))
-        if declared and declared != port:
+        if not declared:
+            # Дыра, через которую прошла та самая регрессия: сервис без
+            # METRICS_PORT берёт умолчание из кода, а его перебивает
+            # глобальный `.env` — и проверка молчала, потому что сравнивать
+            # было нечего. Умолчание в коде не является договорённостью с
+            # compose: явное значение обязательно.
+            silent.append(name)
+        elif declared != port:
             mismatched[name] = (declared, port)
 
+    assert not silent, f"порт метрик не задан явно, умолчание перебьёт общий .env: {silent}"
     assert not mismatched, f"сервис слушает один порт, Prometheus ходит на другой: {mismatched}"
 
 
@@ -234,3 +247,28 @@ def test_services_with_metrics_are_scraped() -> None:
 
     missing = serving - scraped
     assert not missing, f"сервисы отдают метрики, но не скрейпятся: {missing}"
+
+
+# --- поведение на пустых данных (M10.15) ---------------------------------
+
+
+@pytest.mark.parametrize("path", DASHBOARDS, ids=lambda p: p.name)
+def test_panels_explain_emptiness(path: Path) -> None:
+    """У каждой панели подписано, что означает отсутствие данных.
+
+    Пустая панель и панель со сломанным запросом выглядят одинаково: запрос к
+    несуществующей метрике возвращает не ошибку, а пустой результат. Подпись —
+    единственное, что их различает, и она же подсказывает, где смотреть.
+
+    Так были потеряны notifier и writer: панель «Коллбэки» рисовала пустоту, и
+    пустота читалась как «коллбэков не было».
+    """
+    board = json.loads(path.read_text())
+    silent = [
+        panel["title"]
+        for panel in board["panels"]
+        if panel["type"] != "row"
+        and not (panel.get("fieldConfig", {}).get("defaults", {}) or {}).get("noValue")
+    ]
+
+    assert not silent, f"панель молча покажет пустоту: {silent}"

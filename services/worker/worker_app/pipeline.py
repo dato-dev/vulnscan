@@ -154,6 +154,9 @@ class Pipeline:
             table = WeightTable.load(path)
         except Exception:
             logger.exception("новая таблица весов не читается, оставляю прежнюю")
+            # Тот же случай, что и с правилами YARA: сервис продолжает считать
+            # балл по старым весам, и это ничем себя не проявляет.
+            metrics().config_reloads.labels(kind="weights", outcome="failed").inc()
             return False
 
         if table.fingerprint() == self._weights.fingerprint():
@@ -161,6 +164,8 @@ class Pipeline:
 
         self._weights = table
         logger.info("таблица весов перезагружена", extra={"fingerprint": table.fingerprint()})
+        metrics().config_reloads.labels(kind="weights", outcome="applied").inc()
+        metrics().rules_loaded.labels(kind="weights").set(len(table))
         return True
 
     @property
@@ -329,7 +334,14 @@ class Pipeline:
             # Спан на стадию: именно здесь видно, какая проверка съела бюджет.
             # Стадия работает в пуле потоков, но контекст спана наследуется —
             # `to_thread` копирует contextvars.
-            with span("stage", stage=stage.name, timeout_s=timeout) as sp:
+            #
+            # Имя стадии — в имени спана, а не только в атрибуте. Коннектор
+            # `spanmetrics` в коллекторе считает по умолчанию по `span.name`, и
+            # с общим именем «stage» все стадии складывались в один ряд: панель
+            # «p95 по спанам» показывала одну линию вместо шести, то есть ровно
+            # то, ради чего её заводили, было не видно. Атрибут оставлен —
+            # по нему фильтруют в Tempo.
+            with span(f"stage.{stage.name}", stage=stage.name, timeout_s=timeout) as sp:
                 try:
                     ok = await asyncio.wait_for(
                         asyncio.to_thread(stage.safe_run, ctx), timeout=timeout

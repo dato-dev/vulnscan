@@ -1,0 +1,68 @@
+global:
+  resolve_timeout: 5m
+  # smtp_smarthost: "smtp.example.com:587"
+  # smtp_from: "alerts@example.com"
+  # smtp_auth_username: "alerts@example.com"
+  # smtp_auth_password: "secret"
+
+route:
+  receiver: default
+  group_by: [alertname, job, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    # Watchdog никуда не шлём (или отправляйте в Dead Man's Snitch)
+    - matchers:
+        - alertname = "Watchdog"
+      receiver: blackhole
+      group_wait: 0s
+      repeat_interval: 1h
+
+    - matchers:
+        - severity = "critical"
+      receiver: critical
+      repeat_interval: 1h
+
+    - matchers:
+        - severity = "warning"
+      receiver: default
+
+inhibit_rules:
+  # Критический алерт глушит warning по тому же объекту
+  - source_matchers: [severity = "critical"]
+    target_matchers: [severity = "warning"]
+    equal: [alertname, instance]
+
+  # Если таргет лежит — не спамим его метриковыми алертами
+  - source_matchers: [alertname = "TargetDown"]
+    target_matchers: [severity =~ "warning|critical"]
+    equal: [instance]
+
+receivers:
+  - name: blackhole
+
+  - name: default
+    # Раскомментируйте нужный канал:
+    # slack_configs:
+    #   - api_url: "https://hooks.slack.com/services/XXX/YYY/ZZZ"
+    #     channel: "#alerts"
+    #     send_resolved: true
+    #     title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+    #     text: >-
+    #       {{ range .Alerts }}*{{ .Annotations.summary }}*
+    #       {{ .Annotations.description }}
+    #       {{ end }}
+    # webhook_configs:
+    #   - url: "http://my-service:8080/alerts"
+    #     send_resolved: true
+
+  - name: critical
+    # email_configs:
+    #   - to: "oncall@example.com"
+    #     send_resolved: true
+    # telegram_configs:
+    #   - bot_token: "123456:ABC"
+    #     chat_id: -1001234567890
+    #     parse_mode: HTML
+    #     send_resolved: true

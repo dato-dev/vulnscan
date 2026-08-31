@@ -83,8 +83,10 @@ async def scan_upload(
         except CallbackRejectedError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
+    # Контекст трассировки клиента: без него дерево рвётся на HTTP-границе и
+    # «что делал бот» и «что делал сервис» оказываются разными трейсами.
     result, synchronous = await Ingestor(_state(request)).ingest_upload(
-        file, scan_request, idempotency_key
+        file, scan_request, idempotency_key, request.headers.get("traceparent")
     )
     response.status_code = status.HTTP_200_OK if synchronous else status.HTTP_202_ACCEPTED
     return result
@@ -102,7 +104,9 @@ async def scan_by_ref(
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
-    result, synchronous = await Ingestor(_state(request)).ingest_ref(scan_request)
+    result, synchronous = await Ingestor(_state(request)).ingest_ref(
+        scan_request, request.headers.get("traceparent")
+    )
     response.status_code = status.HTTP_200_OK if synchronous else status.HTTP_202_ACCEPTED
     return result
 

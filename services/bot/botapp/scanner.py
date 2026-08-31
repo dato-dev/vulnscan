@@ -22,6 +22,7 @@ from vscommon.signing import (
     canonical_request,
     sign,
 )
+from vscommon.telemetry import current_traceparent
 
 from .config import settings
 
@@ -114,11 +115,21 @@ class ScannerClient:
         """
         payload = body if body is not None else canonical_request(method, path, settings.key_id)
         timestamp, signature = sign(settings.hmac_secret, payload)
-        return {
+        headers = {
             KEY_ID_HEADER: settings.key_id,
             TIMESTAMP_HEADER: timestamp,
             SIGNATURE_HEADER: signature,
         }
+        # Контекст трассировки едет заголовком: бот начинает трейс, gateway его
+        # продолжает. Без этого «что делал бот» и «что делал сервис» — два
+        # несвязанных трейса, и вопрос «где потерялось время» не отвечается.
+        #
+        # В подпись заголовок не входит: подписывается канонический запрос
+        # (метод, путь, идентификатор ключа), поэтому добавление безопасно.
+        traceparent = current_traceparent()
+        if traceparent:
+            headers["traceparent"] = traceparent
+        return headers
 
     async def scan(self, content: bytes, filename: str, mime: str | None) -> ScanOutcome:
         if self._breaker.open:

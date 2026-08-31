@@ -174,6 +174,10 @@ class WeightTable:
         self.degraded = degraded
         """Файл весов задан, но не прочитан. Работаем на встроенных."""
 
+    def __len__(self) -> int:
+        """Сколько кодов знает таблица. Ноль означал бы пустую конфигурацию."""
+        return len(self._rules)
+
     def rule_for(self, key: str) -> Rule:
         rule = self._rules.get(key)
         if rule is None:

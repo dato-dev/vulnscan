@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from vscommon.limits import STAGE_TIMEOUT_S
+from vscommon.metrics import metrics
 
 from ..config import settings
 from .base import ScanContext, Stage
@@ -98,6 +100,10 @@ class YaraStage(Stage):
             compiled = self._compile()
         except Exception:
             logger.exception("новые правила YARA не компилируются, оставляю прежние")
+            # Снаружи это выглядит как работающий воркер, и так оно и есть —
+            # на старом наборе. Счётчик отличает «правила не менялись» от
+            # «правила меняли, и не вышло».
+            metrics().config_reloads.labels(kind="yara", outcome="failed").inc()
             # Отметку не двигаем: попробуем ещё раз, когда файлы поправят.
             return False
 
@@ -108,6 +114,8 @@ class YaraStage(Stage):
             self._stat_signature = stat_signature
 
         logger.info("правила YARA перезагружены", extra={"fingerprint": fingerprint})
+        metrics().config_reloads.labels(kind="yara", outcome="applied").inc()
+        self._report_rules()
         return True
 
     def _ensure_rules(self) -> Any:
@@ -123,6 +131,7 @@ class YaraStage(Stage):
             # же проверка после touch перекомпилировала бы правила впустую.
             self._stat_signature = self._current_stat_signature()
             self._fingerprint = self._content_fingerprint()
+        self._report_rules()
         return self._rules
 
     def _compile(self) -> Any:
@@ -136,6 +145,20 @@ class YaraStage(Stage):
         compiled = yara.compile(filepaths=sources)
         logger.info("правила YARA скомпилированы", extra={"count": len(sources)})
         return compiled
+
+    def _report_rules(self) -> None:
+        """Сколько правил в работе и насколько они свежие.
+
+        Ноль — это работающая стадия, которая ничего не находит: по вердиктам
+        она неотличима от стадии, которой попадаются только чистые файлы.
+        Возраст рядом, потому что правила, не обновлявшиеся месяц, — тоже
+        деградация, просто медленная.
+        """
+        files = self._rule_files()
+        metrics().rules_loaded.labels(kind="yara").set(len(files))
+        if files:
+            newest = max(path.stat().st_mtime for path in files)
+            metrics().rules_age.labels(kind="yara").set(max(0.0, time.time() - newest))
 
     def run(self, ctx: ScanContext) -> None:
         if not settings.yara_enabled:

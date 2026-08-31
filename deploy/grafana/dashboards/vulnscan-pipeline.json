@@ -68,7 +68,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s"
+          "unit": "s",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -109,7 +110,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s"
+          "unit": "s",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -162,7 +164,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -203,7 +206,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit"
+          "unit": "percentunit",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -256,7 +260,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit"
+          "unit": "percentunit",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -297,7 +302,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -350,7 +356,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "s"
+          "unit": "s",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -391,7 +398,8 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "reqps"
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
         },
         "overrides": []
       },
@@ -402,6 +410,206 @@
         },
         "tooltip": {
           "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Конфигурация и вход",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Перезагрузка правил и весов",
+      "description": "Отказ компиляции оставляет прежний набор — сервис продолжает работать, и это правильно. Ровно поэтому незаметно: в логе одна строка.\n\nВсплеск `failed` означает, что кто-то выложил правила, которых нет в работе. Пустота — что конфигурацию не трогали, а не что всё хорошо.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (kind) (rate(vs_config_reloads_total{outcome=\"applied\"}[15m]))",
+          "legendFormat": "принято {{kind}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (kind) (rate(vs_config_reloads_total{outcome=\"failed\"}[15m]))",
+          "legendFormat": "отказ {{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Правил в работе",
+      "description": "Ноль — это работающая стадия, которая ничего не находит: по вердиктам она неотличима от стадии, которой попадаются чистые файлы.\n\nСтупенька вниз после выкладки означает, что часть правил не скомпилировалась. Сверяйте с панелью слева.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vs_rules_loaded",
+          "legendFormat": "{{kind}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Размер входа по квантилям",
+      "description": "Смотрится вместе со временем до вердикта: без неё уехавший p95 неотличим от «стало приходить больше тяжёлых файлов».\n\nКорзины кратны двум — время разбора растёт ступенями, по числу объектов и страниц, а не линейно с байтами.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(vs_input_bytes_bucket[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vs_input_bytes_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(vs_input_bytes_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Отставание истории",
+      "description": "От завершения скана до записи в PostgreSQL. До записи история живёт только в памяти процесса.\n\nРегрессия, ради которой заведено: сброс пачки шёл раз в 64 записи, при слабом потоке база оставалась пустой сутками, и выглядело это как работающий сервис. Норма — единицы секунд; минуты означают накопление.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vs_history_lag_seconds_bucket[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(vs_history_lag_seconds_bucket[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
         }
       }
     }

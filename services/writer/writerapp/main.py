@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import time
 
 from vscommon.logging import setup_logging
 from vscommon.metrics import metrics, setup_metrics
@@ -116,6 +117,14 @@ class Writer:
         for entry_id, _record in batch:
             await self._stream.ack(entry_id)
         logger.info("история записана", extra={"записей": written})
+
+        # Отставание меряется здесь, а не на приёме: до записи в базу история
+        # существует только в памяти процесса. Именно так она однажды и жила —
+        # сброс шёл раз в 64 записи, при слабом потоке база оставалась пустой,
+        # и выглядело это как работающий сервис.
+        now = time.time()
+        for _entry_id, record in batch:
+            metrics().history_lag.observe(max(0.0, now - record.result.created_at))
 
     async def _prune_loop(self) -> None:
         while not self._stopping.is_set():

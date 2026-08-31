@@ -12,6 +12,7 @@ from vscommon.cache import AvCache, StructuralCache
 from vscommon.freshness import HOUR, Age, age_of
 from vscommon.idempotency import ScanRegistry
 from vscommon.keys import KeyRegistry
+from vscommon.metrics import metrics
 from vscommon.ownership import Ownership
 from vscommon.policy import PolicyRegistry
 from vscommon.provisioning import TenantStore
@@ -94,6 +95,9 @@ class AppState:
     async def reload_policies(self) -> None:
         """Подхватывает политики, заведённые через API."""
         self.policies = PolicyRegistry.load(settings, await self.tenants.all_policies())
+        # Файл политик задан, но не прочитан — работаем на встроенных. Пороги
+        # при этом чужие, а вердикты продолжают выдаваться как ни в чём не бывало.
+        metrics().report_degraded("policies", self.policies.degraded)
 
     async def close(self) -> None:
         await self.redis.aclose()

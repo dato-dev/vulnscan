@@ -45,7 +45,12 @@ from vscommon.ratelimit import ConcurrencyLimiter
 from vscommon.redis_client import create_redis
 from vscommon.shadow import ShadowLedger
 from vscommon.storage import S3Store, build_store
-from vscommon.telemetry import continue_trace, setup_tracing, shutdown_tracing
+from vscommon.telemetry import (
+    continue_trace,
+    current_traceparent,
+    setup_tracing,
+    shutdown_tracing,
+)
 
 from .config import settings
 from .deep import deep_job, deep_reason
@@ -249,6 +254,9 @@ class Worker:
                     key_id=job.key_id,
                     url=job.callback_url,
                     payload=result.model_dump_json(),
+                    # Тот же приём, что и на входе в воркер: через очередь
+                    # заголовков нет, контекст едет полем задачи.
+                    traceparent=current_traceparent() or "",
                 )
             )
         except Exception:
@@ -568,6 +576,10 @@ class Worker:
             "engine:libmagic", "on" if self._pipeline.libmagic_available else "off", ex=3600
         )
         await self._redis.set("engine:rules:version", self._pipeline.rules_version, ex=3600)
+
+        # Определение типа по таблице сигнатур вместо libmagic — это работающий
+        # сервис с худшим детектом. В логах об этом одна строка при старте.
+        metrics().report_degraded("libmagic", not self._pipeline.libmagic_available)
 
         # Момент сборки базы, а не только её версия: по версии не понять,
         # остановилось ли обновление. Публикуем разобранное значение, чтобы

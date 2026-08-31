@@ -1074,7 +1074,7 @@ flowchart LR
 ```mermaid
 flowchart LR
     subgraph backend["backend (internal: true)"]
-        GW[gateway] -->|OTLP| COL[vs-collector]
+        GW[gateway] -->|OTLP| COL[otel-collector]
         W[worker] -->|OTLP| COL
         DS[deepscan] -->|OTLP| COL
         PROM[(Prometheus)] -.->|скрейп| GW

@@ -1,0 +1,961 @@
+{
+  "uid": "vulnscan-duty",
+  "title": "vulnscantg — дежурному",
+  "tags": [
+    "vulnscantg",
+    "дежурство"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "description": "Одна страница на вопрос «всё ли хорошо». Верхняя строка отвечает без чтения графиков; ниже — по панели на каждое правило алертов, чтобы сработавший алерт вёл на картинку, а не на поиск нужной панели. Панели порождены из правил Prometheus, поэтому новое правило без панели не останется.",
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Всё ли хорошо",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Путь оповещения",
+      "description": "Watchdog горит всегда. Ноль или пустота означают, что сломался сам механизм оповещения, а не наблюдаемая система — то есть молчанию остальных панелей верить нельзя.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ALERTS{alertname=\"Watchdog\"})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "нет данных",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "color": "red",
+                  "index": 0
+                },
+                "1": {
+                  "color": "green",
+                  "index": 1
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Активных алертов",
+      "description": "Сколько правил сработало прямо сейчас. Пустота здесь — это ноль алертов, но убедитесь по панели слева, что правила вообще вычисляются.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(ALERTS{alertstate=\"firing\",severity=~\"warning|critical\"})"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "нет данных",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Компонентов в урезанном режиме",
+      "description": "Сервис отвечает, но проверка не полная: не прочитан файл политик либо нет libmagic. Ноль обязателен к отображению — отсутствие ряда означает, что метрика не выставляется вовсе.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(vs_degraded)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "нет данных",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Целей не отвечает",
+      "description": "Незаскрейпленная цель даёт пустые панели, а пустая панель неотличима от отсутствия событий. Именно так из наблюдения выпадали notifier, writer и бот.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(up == 0) or vector(0)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "нет данных",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "background",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Критичные: будят человека",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "ПравилаНеВычисляются · critical",
+      "description": "Prometheus не может вычислить правила\n\nПравило с ошибкой не срабатывает никогда. Внешне это неотличимо от благополучия: график ровный, потому что проверки нет.\n\nУсловие: `increase(prometheus_rule_evaluation_failures_total[10m]) > 0` держится 10m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(prometheus_rule_evaluation_failures_total[10m]) > 0",
+          "legendFormat": "ПравилаНеВычисляются"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "АлертыНеДоходят · critical",
+      "description": "Alertmanager не доставляет оповещения\n\nАлерты сработали и остались внутри. В интерфейсе они видны, до дежурного не дошли.\n\nУсловие: `increase(alertmanager_notifications_failed_total[15m]) > 0` держится 15m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(alertmanager_notifications_failed_total[15m]) > 0",
+          "legendFormat": "АлертыНеДоходят"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "PrometheusТеряетАлерты · critical",
+      "description": "Prometheus отбрасывает алерты по пути к Alertmanager\n\nОбрыв на участке между тем, кто сработал, и тем, кто рассылает.\n\nУсловие: `increase(prometheus_notifications_dropped_total[15m]) > 0` держится 15m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "increase(prometheus_notifications_dropped_total[15m]) > 0",
+          "legendFormat": "PrometheusТеряетАлерты"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "БазыАнтивирусаНепригодны · critical",
+      "description": "Базы ClamAV старше недели — вердиктам верить нельзя\n\nGateway при таком возрасте объявляет себя неготовым: `clean` по сигнатурам недельной давности ничего не значит.\n\nУсловие: `vs_rules_age_seconds{kind=\"av_db\"} > 604800` держится 10m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vs_rules_age_seconds{kind=\"av_db\"} > 604800",
+          "legendFormat": "БазыАнтивирусаНепригодны"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "КоллбэкиТеряются · critical",
+      "description": "Результаты не доходят до клиента\n\nПроверка состоялась, но вердикт потерян после исчерпания попыток. Для клиента это неотличимо от того, что файл не проверяли.\n\nУсловие: `rate(vs_callbacks_total{outcome=\"lost\"}[15m]) > 0` держится 15m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 21
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(vs_callbacks_total{outcome=\"lost\"}[15m]) > 0",
+          "legendFormat": "КоллбэкиТеряются"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "СервисНеОтвечает · critical",
+      "description": "{{ $labels.instance }} не отвечает на скрейп\n\n\n\nУсловие: `up{job=~\"vulnscantg.*\"} == 0` держится 2m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 21
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=~\"vulnscantg.*\"} == 0",
+          "legendFormat": "СервисНеОтвечает"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "row",
+      "title": "Предупреждения: разобраться в рабочее время",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 28
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "TargetDown · warning",
+      "description": "Цель {{ $labels.job }} не отвечает\n\nPrometheus не может снять метрики. Панели по этой цели покажут не ошибку, а пустоту — и это будет выглядеть как отсутствие событий.\n\nУсловие: `up{job!~\"vulnscantg.*\"} == 0` держится 5m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 29
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job!~\"vulnscantg.*\"} == 0",
+          "legendFormat": "TargetDown"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "МетрикиИзТрейсовПропали · warning",
+      "description": "Коллектор перестал считать метрики из трейсов\n\nГраф сервисов и «p95 по спанам» опустеют. Именно так выглядел сломанный генератор Tempo, ради обхода которого счёт переехал в коллектор: всё запущено, ошибок нет, данных нет.\n\nУсловие: `absent_over_time(traces_span_metrics_calls_total[15m]) == 1` держится 15m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 29
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "absent_over_time(traces_span_metrics_calls_total[15m]) == 1",
+          "legendFormat": "МетрикиИзТрейсовПропали"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "ЛогиНеПоступают · warning",
+      "description": "Loki выпал из наблюдения\n\nОтсутствие самой метрики `up`, а не её ноль: задание исчезло из конфигурации. Цели уже пропадали так — при правке файла.\n\nУсловие: `absent_over_time(up{job=\"loki\"}[15m]) == 1` держится 15m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "absent_over_time(up{job=\"loki\"}[15m]) == 1",
+          "legendFormat": "ЛогиНеПоступают"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "БазыАнтивирусаУстарели · warning",
+      "description": "Базы ClamAV не обновлялись больше суток\n\nОстановившееся обновление выглядит как работающее: clamd доволен базой, которую нашёл при старте. Проверьте cvdmirror — не упёрся ли он в ограничение частоты у CDN и доходит ли до сети вообще.\n\nУсловие: `vs_rules_age_seconds{kind=\"av_db\"} > 86400` держится 1h.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vs_rules_age_seconds{kind=\"av_db\"} > 86400",
+          "legendFormat": "БазыАнтивирусаУстарели"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "СтадииМассовоПадают · warning",
+      "description": "Стадия {{ $labels.stage }} падает чаще раза в 10 секунд\n\nОтказ стадии сам по себе вердикт не меняет — он даёт признак с низким весом. Массовые отказы означают, что проверка фактически не выполняется, а файлы продолжают получать вердикт.\n\nУсловие: `sum by (stage) (rate(vs_stage_failures_total[5m])) > 0.1` держится 10m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 43
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (stage) (rate(vs_stage_failures_total[5m])) > 0.1",
+          "legendFormat": "СтадииМассовоПадают"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "ДоляВредоносныхАномальна · warning",
+      "description": "Больше трети файлов признаны вредоносными\n\nОбычно это не атака, а сломанное правило или вес: ровно так одна проверка `/OpenAction` пометила 26 из 80 обычных PDF.\n\nУсловие: `sum(rate(vs_scans_total{verdict=\"malicious\"}[30m])) / clamp_min(sum(rate(vs_scans_total[30m])), 0.001) > 0.3` держится 30m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 43
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vs_scans_total{verdict=\"malicious\"}[30m])) / clamp_min(sum(rate(vs_scans_total[30m])), 0.001) > 0.3",
+          "legendFormat": "ДоляВредоносныхАномальна"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "ОчередьРастёт · warning",
+      "description": "В очереди больше 100 неразобранных задач\n\n\n\nУсловие: `sum(vs_queue_depth) > 100` держится 10m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 50
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(vs_queue_depth) > 100",
+          "legendFormat": "ОчередьРастёт"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "ЕстьЗадачиНаРазборЧеловеком · warning",
+      "description": "В dead-letter лежат непроверенные файлы\n\nЭти файлы никто не проверил, и отправитель об этом не знает. Записи живут 7 дней, после чего исчезают вместе с историей.\n\nУсловие: `vs_dlq_size > 0` держится 15m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 50
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "vs_dlq_size > 0",
+          "legendFormat": "ЕстьЗадачиНаРазборЧеловеком"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "ВердиктМедленный · warning",
+      "description": "p95 времени до вердикта выше цели в 700 мс\n\nСинхронные ответы начнут уходить в коллбэк, и клиенты, которые его не реализовали, останутся без результата.\n\nУсловие: `histogram_quantile(0.95, sum by (le) (rate(vs_verdict_duration_seconds_bucket[10m]))) > 0.7` держится 15m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 57
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(vs_verdict_duration_seconds_bucket[10m]))) > 0.7",
+          "legendFormat": "ВердиктМедленный"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "КэшПерестабРаботать · warning",
+      "description": "Попаданий в кэш меньше 10%\n\nОбычно означает, что отпечаток правил или весов меняется чаще, чем должен, и каждый файл проверяется заново.\n\nУсловие: `sum(rate(vs_cache_lookups_total{outcome=\"hit\"}[30m])) / clamp_min(sum(rate(vs_cache_lookups_total[30m])), 0.001) < 0.1` держится 30m.\n\nВ норме здесь ровная линия по нулю. Пустота означает, что метрика не собирается.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 57
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vs_cache_lookups_total{outcome=\"hit\"}[30m])) / clamp_min(sum(rate(vs_cache_lookups_total[30m])), 0.001) < 0.1",
+          "legendFormat": "КэшПерестабРаботать"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "noValue": "Нет данных — метрика не собирается",
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    }
+  ]
+}

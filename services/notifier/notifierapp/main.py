@@ -26,7 +26,7 @@ from vscommon.metrics import serve as serve_metrics
 from vscommon.models import CallbackTask, DeadLetter, DeadLetterReason
 from vscommon.queue import CallbackQueue, DeadLetterQueue
 from vscommon.redis_client import create_redis
-from vscommon.telemetry import setup_tracing, shutdown_tracing, span
+from vscommon.telemetry import continue_trace, setup_tracing, shutdown_tracing
 
 from .config import settings
 from .sender import CallbackSender
@@ -76,7 +76,12 @@ class Notifier:
     async def _attempt(self, task: CallbackTask) -> None:
         with (
             log_context(scan_id=task.scan_id, tenant=task.tenant),
-            span("callback.deliver", host=task.host, attempt=task.attempt),
+            continue_trace(
+                task.traceparent,
+                "callback.deliver",
+                host=task.host,
+                attempt=task.attempt,
+            ),
         ):
             outcome = await self._sender.send(task)
 

@@ -22,10 +22,12 @@ import html
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import HTMLResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 try:
     from vulnscan_client import VulnscanClient, VulnscanError
@@ -57,12 +59,35 @@ POLL_DELAY_S = 1.0
 
 app = FastAPI(title="Обратная связь", docs_url=None, redoc_url=None)
 
+# M10.10. Метрики стороны, которая подключается, а не сервиса. Префикс свой,
+# не `vs_`: `vs_` принадлежит коду сканера, здесь же измеряется поведение
+# клиента — то, что увидела бы у себя подключающаяся команда.
+#
+# Вопрос, на который они отвечают, ровно один: что происходит с посетителем,
+# приложившим файл. Сколько ждал, чем кончилось, и как часто вместо ответа он
+# получает «попробуйте позже», потому что проверка не состоялась. Последнее
+# особенно важно: отказ проверки — это не ошибка сайта и в его собственных
+# метриках ошибок HTTP не виден вовсе.
+uploads = Counter("feedback_uploads_total", "Вложения по исходу проверки", ("outcome",))
+wait_seconds = Histogram(
+    "feedback_scan_wait_seconds",
+    "Сколько посетитель ждал вердикта",
+    buckets=(0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0),
+)
+scanner_errors = Counter(
+    "feedback_scanner_errors_total", "Проверка не состоялась", ("kind",)
+)
+
 # Обезвреженные копии живут в памяти процесса до перезапуска: это витрина,
 # а не хранилище. Оригиналы не сохраняются вообще.
 _clean_files: dict[str, tuple[bytes, str]] = {}
 
 
 def _client() -> VulnscanClient:
+    # `trace_context` здесь не передаётся: пример намеренно не тянет
+    # OpenTelemetry — библиотека обязана работать с одним httpx. Команда,
+    # которая трассировку ведёт, передаёт сюда функцию, возвращающую свой
+    # текущий `traceparent`, и её трейс продолжится на стороне сервиса.
     return VulnscanClient(base_url=SCANNER_URL, key_id=KEY_ID, secret=SECRET, wait_ms=5000)
 
 
@@ -135,8 +160,10 @@ async def submit(
 
     content = await attachment.read(MAX_BYTES + 1)
     if len(content) > MAX_BYTES:
+        uploads.labels(outcome="too_large").inc()
         return PAGE.format(result=_box("warn", "Файл больше 16 МБ — пришлите поменьше."))
 
+    started = time.monotonic()
     try:
         async with _client() as client:
             outcome = await client.scan(
@@ -146,6 +173,10 @@ async def submit(
         # Проверка не состоялась. Принимать непроверенный файл нельзя: это
         # оставляет без защиты ровно тогда, когда что-то уже пошло не так.
         logger.warning("сканер недоступен: %s", type(exc).__name__)
+        # Тип исключения, а не текст: текст может содержать адрес и параметры,
+        # а метка обязана быть из закрытого списка.
+        scanner_errors.labels(kind=type(exc).__name__).inc()
+        uploads.labels(outcome="unchecked").inc()
         return PAGE.format(
             result=_box("warn", "Не смогли проверить вложение. Попробуйте чуть позже.")
         )
@@ -156,7 +187,10 @@ async def submit(
     if outcome.pending:
         outcome = await _await_result(outcome.scan_id) or outcome
 
+    wait_seconds.observe(time.monotonic() - started)
+
     if outcome.pending:
+        uploads.labels(outcome="pending").inc()
         return PAGE.format(
             result=_box(
                 "warn",
@@ -165,6 +199,9 @@ async def submit(
             )
         )
 
+    # Вердикт как метка допустим: список закрыт и задан сервисом. Ни имя файла,
+    # ни идентификатор скана в метки не попадают — это был бы ряд на посетителя.
+    uploads.labels(outcome=outcome.verdict).inc()
     return PAGE.format(result=await _decide(outcome, who))
 
 
@@ -250,6 +287,15 @@ async def _fetch_clean(outcome: object) -> str:
         return ""
     _clean_files[scan_id] = (clean, "application/pdf")
     return f'<br><a href="/clean/{html.escape(scan_id)}">Скачать безопасную копию</a>'
+
+
+@app.get("/metrics")
+async def metrics_endpoint() -> Response:
+    """Отдельного порта нет: у сайта уже есть свой HTTP, и заводить второй
+    ради четырёх метрик незачем. У сервисов сканера порт отдельный по другой
+    причине — у воркера и бота своего HTTP нет вовсе.
+    """
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/clean/{scan_id}")
