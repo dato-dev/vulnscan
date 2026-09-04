@@ -16,8 +16,9 @@ from vscommon.metrics import setup_metrics
 from vscommon.telemetry import setup_tracing, shutdown_tracing
 
 from .config import settings
+from .cors import cors_middleware
 from .observability import metrics_middleware
-from .routes import admin, health, ops, scan
+from .routes import admin, health, ops, scan, widget
 from .state import build_state
 from .throttle import throttle_middleware
 
@@ -73,10 +74,15 @@ app = FastAPI(
 # Порядок важен: метрики снаружи, чтобы в них попали и отвергнутые запросы.
 app.middleware("http")(throttle_middleware)
 app.middleware("http")(metrics_middleware)
+# Регистрируется последним — значит выполняется первым. Так и нужно: preflight
+# не должен расходовать лимит частоты и попадать в метрики как обращение
+# клиента, он служебный.
+app.middleware("http")(cors_middleware)
 app.include_router(health.router)
 app.include_router(scan.router)
 app.include_router(ops.router)
 app.include_router(admin.router)
+app.include_router(widget.router)
 
 
 async def _reload_loop(app: FastAPI) -> None:

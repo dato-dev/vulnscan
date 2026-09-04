@@ -27,14 +27,13 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT.parent / "packages"))
 sys.path.insert(0, str(ROOT.parent / "services" / "worker"))
 
-from app.scoring import verdict_of
-from app.stages.base import ScanContext
-from app.stages.filetype import FiletypeStage
-from app.stages.structure import StructureStage
-
 from vscommon.logging import setup_logging
 from vscommon.models import ObjectRef, ScanJob, TenantPolicy
 from vscommon.weights import WeightTable
+from worker_app.scoring import verdict_of
+from worker_app.stages.base import ScanContext
+from worker_app.stages.filetype import FiletypeStage
+from worker_app.stages.structure import StructureStage
 
 MANIFEST = ROOT / "manifest.csv"
 EXPECTED = ROOT / "expected.json"
@@ -153,12 +152,13 @@ def main() -> int:
     total_injected = sum(b.total for b in injected)
     print("-" * 96)
     if total_injected:
-        print(f"\nдетект по инъекциям:   {caught}/{total_injected} "
-              f"({caught / total_injected * 100:.0f}%)")
+        print(
+            f"\nдетект по инъекциям:   {caught}/{total_injected} "
+            f"({caught / total_injected * 100:.0f}%)"
+        )
     known = clean.flagged - len(unexpected)
     print(f"чистых файлов:         {clean.total}")
-    print(f"  срабатываний:        {clean.flagged} "
-          f"(разобрано и признано верными: {known})")
+    print(f"  срабатываний:        {clean.flagged} (разобрано и признано верными: {known})")
     print(f"  НЕ разобрано:        {len(unexpected)}")
 
     if unexpected:

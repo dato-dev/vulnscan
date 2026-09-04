@@ -22,7 +22,7 @@ import logging
 
 from fastapi import HTTPException, Request, status
 
-from vscommon.keys import KEY_ID_HEADER, AccessKey
+from vscommon.keys import KEY_ID_HEADER, AccessKey, origin_allowed
 from vscommon.signing import (
     MAX_SKEW_S,
     SIGNATURE_HEADER,
@@ -42,6 +42,113 @@ async def require_key(request: Request) -> AccessKey:
     выбор политики больше не влияет.
     """
     return await _authenticate(request, body=None)
+
+
+TICKET_HEADER = "X-Vulnscan-Ticket"
+ORIGIN_HEADER = "Origin"
+
+
+def _own_origin(request: Request) -> str:
+    """Origin самого сервиса — тот, с которого отдан документ фрейма.
+
+    Берётся из заголовка `Host`, а не из настройки: за обратным прокси адрес
+    задаёт он, и зашитое значение разошлось бы с действительностью ровно там,
+    где это труднее всего заметить.
+    """
+    host = request.headers.get("host", "")
+    return f"{request.url.scheme}://{host}".rstrip("/").lower() if host else ""
+
+
+async def require_site_key(request: Request) -> AccessKey:
+    """Публичный ключ сайта плюс разрешённый `Origin` (M12.3).
+
+    Единственное, что этим ключом можно сделать, — получить талон. Подписи тут
+    нет и быть не может: ключ лежит открыто в HTML, и «секрет» у него знает
+    каждый посетитель.
+
+    Отсюда же следует, чего эта проверка НЕ даёт. `Origin` ставит браузер, и
+    вне браузера он подделывается свободно. Проверка защищает от того, что
+    чужой сайт вставит ваш ключ к себе и будет расходовать вашу квоту; от
+    скрипта, который шлёт запросы напрямую, защищают только квоты (M12.5).
+    Считать её защитой от подделки нельзя.
+    """
+    key_id = request.headers.get(KEY_ID_HEADER, "").strip()
+    origin = request.headers.get(ORIGIN_HEADER, "")
+
+    registry = request.app.state.vs.keys
+    if registry.degraded:
+        logger.error("реестр ключей недоступен, запрос отклонён")
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "аутентификация временно недоступна"
+        )
+
+    key = registry.get(key_id) if key_id else None
+
+    # Origin принимается в двух случаях, и второй неочевиден.
+    #
+    # 1. Адрес из списка ключа — прямой вызов со страницы сайта, кросс-доменно.
+    #
+    # 2. НАШ СОБСТВЕННЫЙ адрес — запрос пришёл из документа фрейма. Фрейм
+    #    живёт на нашем origin, и обращение к `/v1/tickets` для него
+    #    same-origin: браузер поставит наш адрес, а не адрес сайта.
+    #
+    #    Доверие здесь опирается не на заголовок, а на `frame-ancestors`:
+    #    загрузиться этот документ мог только на странице из списка ключа, и
+    #    проверяет это браузер. Без второй ветки виджет не работает вовсе —
+    #    ровно то, на чём он и споткнулся при первом же запуске.
+    from_our_frame = bool(origin) and origin.rstrip("/").lower() == _own_origin(request)
+
+    if key is None or not key.public or not (from_our_frame or origin_allowed(key, origin)):
+        # Одна ветка на три случая: ключа нет, ключ не публичный, origin чужой.
+        # Разделять их в ответе — подсказывать, какой из них исправить.
+        logger.warning(
+            "ключ сайта отклонён",
+            extra={"key_id": key_id, "origin_known": bool(origin)},
+        )
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "ключ сайта недействителен")
+
+    request.state.access_key = key
+    request.state.origin = origin
+    return key
+
+
+async def require_key_or_ticket(request: Request) -> AccessKey:
+    """Загрузка: либо подпись, либо одноразовый талон (M12.2).
+
+    Талон — предмет, который можно отдать в браузер: им нельзя ни прочитать
+    результат, ни скачать копию, ни загрузить второй файл. Поэтому он принят
+    ЗДЕСЬ и только здесь; на остальных ручках заголовок с талоном просто не
+    смотрят, и предъявивший его получит обычное «запрос не подписан».
+
+    Порядок проверки важен: сначала подпись. Иначе клиент с валидной подписью,
+    случайно приславший протухший талон, получил бы отказ вместо загрузки.
+    """
+    if request.headers.get(KEY_ID_HEADER, "").strip():
+        return await _authenticate(request, body=None)
+
+    token = request.headers.get(TICKET_HEADER, "").strip()
+    if not token:
+        return await _authenticate(request, body=None)
+
+    ticket = await request.app.state.vs.tickets.redeem(token)
+    if ticket is None:
+        # Причина не уходит в ответ: «не существовал», «истёк» и «уже погашен»
+        # для предъявителя одно и то же, а различать их — значит подсказывать.
+        logger.warning("талон отклонён", extra={"path": request.url.path})
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "талон недействителен")
+
+    # Отключённый ключ реестр не возвращает — это его правило, и второй
+    # проверки здесь нет намеренно: два места, решающих одно, расходятся.
+    # Следствие важное: отзыв ключа гасит и выданные им талоны сразу, а не
+    # «примерно скоро», когда истечёт последний.
+    key = request.app.state.vs.keys.get(ticket.key_id)
+    if key is None:
+        logger.warning("талон выдан ключом, которого больше нет", extra={"key_id": ticket.key_id})
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "талон недействителен")
+
+    request.state.access_key = key
+    request.state.ticket = ticket
+    return key
 
 
 async def require_signed_body(request: Request) -> bytes:
@@ -64,6 +171,29 @@ async def require_signed_ops(request: Request) -> bytes:
     body = await request.body()
     await _authenticate(request, body=body)
     return body
+
+
+async def ops_scope(request: Request) -> str | None:
+    """Чьи служебные данные вправе видеть вызывающий (M7.7).
+
+    `None` — все: так отвечает только административный ключ. Обычному ключу
+    возвращается его тенант, и ручка обязана этим ограничиться.
+
+    Зачем понадобилось. Подписи для служебных ручек хватало любой, а отдают
+    они разбор карантина, список доверенных и учёт теневого режима. Читать
+    там нечего только на одном тенанте: `scan_id` и ключи объектов соседей,
+    авторы и причины их разрешений — это рассказ о чужом потоке документов.
+    Хуже того, `POST /v1/ops/allowlist` принимал `tenant: "*"`, то есть любой
+    клиент мог снять блокировку с файла сразу для всех.
+    """
+    key = key_of(request)
+    if key is None:
+        # Сюда попадают только после `require_signed_ops`, который без ключа
+        # не пропускает. Отсутствие ключа значит, что порядок зависимостей
+        # сломали — и тогда сузить видимость некуда, кроме «ничего».
+        logger.error("служебная ручка без проверенного ключа: порядок зависимостей")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "запрос не подписан")
+    return None if key.admin else key.tenant
 
 
 async def _authenticate(request: Request, body: bytes | None) -> AccessKey:

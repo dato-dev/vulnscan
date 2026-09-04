@@ -48,6 +48,30 @@ class AccessKey:
     обращений во внутреннюю сеть.
     """
 
+    public: bool = False
+    """Ключ сайта: лежит открыто в HTML страницы (M12.3).
+
+    Признак на том же объекте, а не отдельный список, — по той же причине, что
+    и `admin`: второй способ аутентификации рано или поздно отстал бы от
+    первого.
+
+    Такой ключ умеет ровно одно — получить талон на загрузку. Подписывать им
+    нельзя ФИЗИЧЕСКИ: его «секрет» знает каждый посетитель сайта, и проверка
+    подписи таким ключом означала бы, что подписать может кто угодно. Поэтому
+    `check()` отвергает его до сравнения подписи.
+    """
+
+    origins: tuple[str, ...] = ()
+    """С каких origin принимать этот публичный ключ.
+
+    Пусто — ключ не работает нигде. Это осознанный fail-closed: публичный ключ
+    без списка origin годится для любого сайта в интернете.
+
+    Проверка защищает от использования ключа на ЧУЖОЙ странице, а не от
+    скрипта в консоли: `Origin` вне браузера подделывается. От второго
+    защищают квоты (M12.5), и путать эти две защиты нельзя.
+    """
+
 
 class KeyRegistry:
     """Ключи из файла. Перезагружается на живом сервисе.
@@ -89,11 +113,29 @@ class KeyRegistry:
         key = self.get(key_id)
         if key is None:
             return None, SignatureCheck(Rejection.MISMATCH)
+        if key.public:
+            # Секрет публичного ключа публичен. Проверять им подпись — значит
+            # принимать подпись от любого, кто открыл исходный код страницы.
+            # Отказ здесь, а не в вызывающем коде: место одно, и обойти его
+            # нельзя, забыв проверку на стороне маршрута.
+            logger.warning(
+                "публичный ключ предъявлен как подписывающий", extra={"key_id": key_id}
+            )
+            return None, SignatureCheck(Rejection.MISMATCH)
         check = check_signature(key.secret, body, timestamp, signature)
         return (key if check.ok else None), check
 
     def __len__(self) -> int:
         return len(self._keys)
+
+    def all_keys(self) -> tuple[AccessKey, ...]:
+        """Все записи, включая отключённые.
+
+        Отключённые тоже отдаются: вызывающему может понадобиться отличить
+        «ключа нет» от «ключ отозван». Кто этой разницей не пользуется —
+        фильтрует сам, и это заметно в коде.
+        """
+        return tuple(self._keys.values())
 
     @property
     def tenants(self) -> tuple[str, ...]:
@@ -185,6 +227,27 @@ def _parse(key_id: str, entry: object) -> AccessKey | None:
         logger.error("список адресов коллбэка не является массивом", extra={"key_id": key_id})
         hosts = []
 
+    origins = entry.get("origins") or []
+    if not isinstance(origins, list):
+        logger.error("список origin не является массивом", extra={"key_id": key_id})
+        origins = []
+
+    public = bool(entry.get("public", False))
+    if public and entry.get("admin"):
+        # Публичный ключ администратора — это ключ администратора в HTML.
+        # Не «нежелательно», а невозможно: запись не загружается вовсе.
+        logger.error("ключ не может быть одновременно публичным и административным",
+                     extra={"key_id": key_id})
+        return None
+    if public and not origins:
+        # Загружаем, но предупреждаем: сам по себе такой ключ безвреден —
+        # `origin_allowed` не пропустит с ним ни один адрес, — а вот молчание
+        # оставило бы владельца в уверенности, что ключ работает.
+        logger.warning(
+            "у публичного ключа не задан ни один origin: он не будет работать нигде",
+            extra={"key_id": key_id},
+        )
+
     return AccessKey(
         key_id=key_id,
         tenant=tenant,
@@ -192,4 +255,33 @@ def _parse(key_id: str, entry: object) -> AccessKey | None:
         disabled=bool(entry.get("disabled", False)),
         admin=bool(entry.get("admin", False)),
         callback_hosts=tuple(str(h).lower() for h in hosts if isinstance(h, str)),
+        public=public,
+        origins=tuple(str(o) for o in origins if isinstance(o, str)),
     )
+
+
+def origin_allowed(key: AccessKey, origin: str) -> bool:
+    """Разрешён ли этот `Origin` для публичного ключа сайта (M12.3).
+
+    Сравнение точное и без подстановочных знаков. Причина не в лени: маска вида
+    `*.example.com` превращает захват любого поддомена — заброшенного, чужого,
+    поднятого через забытую CNAME — в кражу ключа. Список из трёх адресов
+    руками дешевле, чем разбирательство, откуда взялись загрузки.
+
+    Регистр схемы и хоста не значим, завершающая косая черта игнорируется:
+    браузеры шлют `Origin` без неё, но настраивают список люди.
+    """
+    if not key.public or not key.origins:
+        # Ветка ничего не охраняет: пустой список не совпал бы и так, а
+        # `public` проверяет вызывающая сторона. Она здесь ради читателя —
+        # чтобы «публичный ключ без origin не работает нигде» было видно
+        # сразу, а не выводилось из того, что `any()` по пустому ложен.
+        return False
+
+    candidate = origin.strip().rstrip("/").lower()
+    if not candidate or candidate == "null":
+        # `Origin: null` шлют документы из песочницы и файлы с диска. Совпадать
+        # с настроенным адресом оно не может, а выглядит как валидное значение.
+        return False
+
+    return any(candidate == allowed.strip().rstrip("/").lower() for allowed in key.origins)

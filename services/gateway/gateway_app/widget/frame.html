@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Проверка вложения</title>
+<style>
+/* Оформление задаётся переменными CSS. Сайт передаёт их параметрами адреса
+   фрейма — см. loader.js, атрибуты `data-vulnscan-*`.
+
+   Почему переменные, а не «пришлите нам свой CSS». Чужие стили внутри нашего
+   документа — это чужой код на нашем origin: `background-image: url(...)`
+   умеет обращаться наружу, а селекторы умеют доставать до всего, что мы
+   покажем. Ограниченный список переменных даёт вписать виджет в дизайн и не
+   даёт превратить его во что-то другое.
+
+   Значения проверяются на сервере: сюда попадают только цвета, размеры и
+   названия шрифтов, а не произвольный текст. */
+:root {
+  color-scheme: light dark;
+  --vs-font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --vs-size: 14px;
+  --vs-color: inherit;
+  --vs-accent: #2563eb;
+  --vs-radius: 10px;
+  --vs-gap: 10px;
+  --vs-error: #b3261e;
+  --vs-warn: #8a5a00;
+  --vs-ok: #146c43;
+  /* Производные: собираются из акцента, чтобы сайту хватало одного цвета.
+     `color-mix` поддержан во всех актуальных браузерах, а там, где нет,
+     сработает запасное значение из второго объявления ниже. */
+  --vs-border: #c9ced6;
+  --vs-surface: transparent;
+}
+@supports (color: color-mix(in srgb, red 50%, white)) {
+  :root {
+    --vs-border: color-mix(in srgb, var(--vs-accent) 28%, transparent);
+    --vs-surface: color-mix(in srgb, var(--vs-accent) 5%, transparent);
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: var(--vs-font);
+  font-size: var(--vs-size);
+  line-height: 1.45;
+  color: var(--vs-color);
+  background: transparent;
+}
+
+/* Зона выбора: одна крупная цель вместо системной кнопки, которую нельзя
+   оформить одинаково в разных браузерах. Сам `input` спрятан, но остаётся в
+   потоке — иначе клавиатура и чтение с экрана до него не доберутся. */
+.drop {
+  display: flex;
+  align-items: center;
+  gap: var(--vs-gap);
+  padding: 12px 14px;
+  border: 1px dashed var(--vs-border);
+  border-radius: var(--vs-radius);
+  background: var(--vs-surface);
+  cursor: pointer;
+  transition: border-color .15s, background .15s;
+}
+.drop:hover, .drop:focus-within { border-color: var(--vs-accent); }
+.drop:focus-within { outline: 2px solid var(--vs-accent); outline-offset: 2px; }
+
+/* `opacity: 0` вместо `display: none`: скрытый вторым способом элемент
+   выпадает из порядка обхода, и виджет перестаёт работать с клавиатуры. */
+.drop input[type="file"] {
+  position: absolute;
+  width: 1px; height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.icon { display: flex; color: var(--vs-accent); flex: 0 0 auto; }
+.text { display: flex; flex-direction: column; min-width: 0; }
+.title {
+  font-weight: 600;
+  /* Имя файла бывает длинным, а ширину фрейма задаёт чужая вёрстка. */
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.hint { opacity: .7; font-size: .88em; }
+
+.spin {
+  margin-left: auto;
+  width: 16px; height: 16px;
+  border: 2px solid var(--vs-border);
+  border-top-color: var(--vs-accent);
+  border-radius: 50%;
+  display: none;
+}
+.busy .spin { display: block; animation: vs-spin .7s linear infinite; }
+@keyframes vs-spin { to { transform: rotate(360deg); } }
+/* Тем, кто отключил анимации в системе, крутилка не нужна — достаточно того,
+   что она видна как индикатор. */
+@media (prefers-reduced-motion: reduce) { .busy .spin { animation: none; } }
+
+.busy .drop { cursor: progress; }
+.done .drop { border-style: solid; }
+
+.state { min-height: 1.45em; margin: 8px 2px 0; font-size: .92em; }
+.bad { color: var(--vs-error); }
+.warn { color: var(--vs-warn); }
+.ok { color: var(--vs-ok); }
+.bad .drop, .warn .drop, .ok .drop { border-style: solid; }
+.bad .drop { border-color: var(--vs-error); }
+.warn .drop { border-color: var(--vs-warn); }
+.ok .drop { border-color: var(--vs-ok); }
+.bad .icon { color: var(--vs-error); }
+.ok .icon { color: var(--vs-ok); }
+</style>
+<style id="theme">__THEME__</style>
+<style id="theme">__THEME__</style>
+</head>
+<body>
+<div class="vs" id="root">
+  <label class="drop" id="drop" for="file">
+    <input type="file" id="file" accept="application/pdf,image/*">
+    <span class="icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 16V4m0 0L8 8m4-4 4 4"/><path d="M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+      </svg>
+    </span>
+    <span class="text">
+      <span class="title" id="title">Приложить файл</span>
+      <span class="hint" id="hint">PDF или изображение</span>
+    </span>
+    <span class="spin" id="spin" aria-hidden="true"></span>
+  </label>
+  <p class="state" id="state" role="status" aria-live="polite"></p>
+</div>
+
+<script>
+// Документ фрейма. Живёт на НАШЕМ origin, поэтому страница сайта не имеет
+// доступа ни к выбранному файлу, ни к этому коду, а мы — к её DOM.
+//
+// Наружу отсюда уходит ровно одно: идентификатор проверки. Ни талон, ни ключ,
+// ни содержимое файла в родительское окно не передаются — талон это предмет
+// для загрузки, и отдавать его на страницу значит отдавать возможность
+// грузить файлы от имени сайта.
+(function () {
+  "use strict";
+
+  var params = new URLSearchParams(location.search);
+  var siteKey = params.get("key") || "";
+  // Origin родителя приходит параметром: сам фрейм узнать его не может.
+  // Подделать его может только тот, кто и так встраивает нас у себя, — он
+  // ничего этим не выигрывает, потому что сообщения уйдут ему же.
+  var parentOrigin = params.get("origin") || "";
+
+  // Подставляется сервером из политики тенанта: "block" или "mark" (M12.9).
+  // Здесь это значение только исполняется, а не выбирается — выбор сделан на
+  // стороне, которую посетитель не правит.
+  var ON_UNAVAILABLE = "__ON_UNAVAILABLE__";
+
+  var input = document.getElementById("file");
+  var state = document.getElementById("state");
+  var root = document.getElementById("root");
+  var title = document.getElementById("title");
+  var hint = document.getElementById("hint");
+
+  // Сколько ждём результат опросом. Двадцать секунд крупному PDF со всеми
+  // стадиями хватает; дальше честнее сказать «ещё проверяется», чем крутить
+  // индикатор бесконечно.
+  var POLL_MS = 1500;
+  var POLL_LIMIT = 14;
+
+  function say(text, kind) {
+    state.textContent = text;
+    state.className = "state";
+    root.className = "vs" + (kind ? " " + kind : "");
+  }
+
+  function busy(text) {
+    state.textContent = text;
+    root.className = "vs busy";
+  }
+
+  function tell(message) {
+    if (!parentOrigin) { return; }
+    // Конкретный origin, никогда "*": со звёздочкой сообщение прочитал бы
+    // любой фрейм, оказавшийся в цепочке.
+    parent.postMessage(Object.assign({ source: "vulnscan" }, message), parentOrigin);
+  }
+
+  async function ticket() {
+    var response = await fetch("/v1/tickets", {
+      method: "POST",
+      headers: { "X-Vulnscan-Key": siteKey },
+    });
+    if (!response.ok) { throw new Error("ticket:" + response.status); }
+    return (await response.json()).ticket;
+  }
+
+  async function upload(file, token) {
+    var form = new FormData();
+    form.append("file", file, file.name);
+    form.append("meta", JSON.stringify({ filename: file.name }));
+
+    var response = await fetch("/v1/scan", {
+      method: "POST",
+      headers: { "X-Vulnscan-Ticket": token },
+      body: form,
+    });
+    if (!response.ok) { throw new Error("scan:" + response.status); }
+    return {
+      outcome: await response.json(),
+      // Талон на наблюдение приходит заголовком и только когда проверка не
+      // уложилась в отведённое время.
+      statusTicket: response.headers.get("X-Vulnscan-Status-Ticket") || "",
+    };
+  }
+
+  var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
+
+  /**
+   * Дожидается конца проверки.
+   *
+   * Без этого посетитель, приложивший крупный файл, оставался с надписью
+   * «вложение ещё проверяется» навсегда: `202` приходил, а узнать исход фрейм
+   * не мог — чтение вердикта требует подписи, которой у него нет и быть не
+   * должно. Талон наблюдения закрывает ровно этот разрыв и ничего больше.
+   */
+  async function await_result(statusTicket) {
+    if (!statusTicket) { return null; }
+
+    for (var attempt = 0; attempt < POLL_LIMIT; attempt += 1) {
+      await sleep(POLL_MS);
+      var response = await fetch(
+        "/widget/v1/status?ticket=" + encodeURIComponent(statusTicket),
+      );
+      if (!response.ok) { return null; }
+
+      var body = await response.json();
+      if (body.done) { return body; }
+    }
+    return null;
+  }
+
+  function finish(outcome, scanId) {
+    if (outcome === "blocked") {
+      say("Вложение заблокировано — отправьте другой файл.", "bad");
+      input.value = "";
+      title.textContent = "Приложить файл";
+      hint.textContent = "PDF или изображение";
+      tell({ type: "blocked", scan_id: scanId });
+      return;
+    }
+    if (outcome === "checked") {
+      say("Вложение проверено.", "ok");
+      hint.textContent = "проверено";
+      tell({ type: "checked", scan_id: scanId });
+      return;
+    }
+    // Проверить не удалось: формат не поддержан, файл зашифрован, стадия
+    // отвалилась. Не «чисто» — и говорим об этом прямо.
+    var block = ON_UNAVAILABLE !== "mark";
+    if (block) {
+      input.value = "";
+      title.textContent = "Приложить файл";
+      say("Вложение не удалось проверить — приложите другой файл.", "warn");
+    } else {
+      say("Вложение не проверено — сайт решит, принимать ли его.", "warn");
+    }
+    tell({ type: "unchecked", allow_submit: !block, reason: "verdict" });
+  }
+
+  input.addEventListener("change", async function () {
+    var file = input.files && input.files[0];
+    if (!file) { return; }
+
+    title.textContent = file.name;
+    hint.textContent = Math.max(1, Math.round(file.size / 1024)) + " КБ";
+    busy("Проверяем вложение…");
+    tell({ type: "busy" });
+
+    try {
+      var sent = await upload(file, await ticket());
+    } catch (error) {
+      // «Не смогли проверить» — это НЕ «чисто». Что делать дальше, решает
+      // политика тенанта, а не эта страница.
+      var block = ON_UNAVAILABLE !== "mark";
+      if (block) {
+        input.value = "";
+        title.textContent = "Приложить файл";
+        say("Не смогли проверить вложение. Попробуйте позже.", "warn");
+      } else {
+        say("Вложение не проверено — сайт решит, принимать ли его.", "warn");
+      }
+      tell({
+        type: "unchecked",
+        allow_submit: !block,
+        reason: String(error.message || "network"),
+      });
+      return;
+    }
+
+    var result = sent.outcome;
+    var pending = result.status === "queued" || result.status === "scanning";
+
+    if (!pending) {
+      finish(
+        result.verdict === "malicious"
+          ? "blocked"
+          : result.verdict === "clean"
+            ? "checked"
+            : "unchecked",
+        result.scan_id,
+      );
+      return;
+    }
+
+    // Ответ отложенный — ждём и показываем это, а не бросаем посетителя.
+    busy("Проверяем вложение, это займёт немного дольше…");
+    tell({ type: "pending", scan_id: result.scan_id });
+
+    var final = await await_result(sent.statusTicket);
+    if (final === null) {
+      // Не дождались. Файл принят и проверяется, но обещать посетителю
+      // результат мы больше не можем.
+      say("Проверка ещё идёт. Отправьте форму через минуту.", "warn");
+      tell({ type: "pending", scan_id: result.scan_id });
+      return;
+    }
+
+    finish(final.outcome, final.scan_id || result.scan_id);
+  });
+
+  tell({ type: "ready" });
+})();
+</script>
+</body>
+</html>

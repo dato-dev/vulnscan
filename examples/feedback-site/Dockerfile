@@ -5,14 +5,34 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir \
-    "fastapi>=0.115" "uvicorn[standard]>=0.32" "python-multipart>=0.0.12" "httpx>=0.28"
+# uv приезжает готовым бинарником из своего образа. Раньше он ставился pip'ом —
+# это был единственный вызов pip во всём репозитории; теперь pip не участвует
+# в сборке вовсе.
+#
+# Цена решения названа честно: в цепочку сборки добавился ghcr.io. Раньше от
+# него отказывались именно поэтому. Размен принят ради того, чтобы установщик
+# был один и тот же локально и в образе, без промежуточного pip.
+#
+# Версия закреплена точно. Плавающий тег установщика означал бы, что состав
+# образа меняется от пересборки к пересборке при неизменных исходниках.
+COPY --from=ghcr.io/astral-sh/uv:0.11.25 /uv /usr/local/bin/uv
 
-# Версия клиента метрик — из общего файла: разъехавшись, образы дают разный
-# формат экспозиции, и Prometheus молча перестаёт разбирать часть рядов.
-# Трассировки здесь нет — пример показывает сторону клиента.
-COPY requirements-metrics.txt ./
-RUN pip install --no-cache-dir -r requirements-metrics.txt
+# Состав образа берётся из `uv.lock`, и только из своей группы. Общий список
+# зависимостей означал бы, что gateway тащит pikepdf, pillow и yara-python —
+# три библиотеки на C, разбирающие недоверенный ввод, в образ, который ничего
+# не разбирает.
+#
+# `--frozen`: лок не пересчитывается при сборке. Без этого образ мог бы уехать
+# на версиях, которых никто не видел, и разошлось бы это молча.
+# Хэши в экспорте не отключаются: сборка проверяет, что скачала именно то, что
+# записано в локе.
+# `--system`: виртуальное окружение в контейнере с одним процессом — лишний
+# слой без выгоды.
+COPY pyproject.toml uv.lock ./
+RUN uv export --frozen --no-default-groups --group demo-site --group metrics \
+        -o /tmp/requirements.txt \
+    && uv pip install --system --no-cache -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 COPY packages/vulnscan_client /app/vulnscan_client
 COPY examples/feedback-site/feedback_site.py /app/feedback_site.py

@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 
 from vscommon.allowlist import Allowlist
 from vscommon.cache import AvCache, StructuralCache
+from vscommon.canary import CanaryLedger
 from vscommon.freshness import HOUR, Age, age_of
 from vscommon.idempotency import ScanRegistry
 from vscommon.keys import KeyRegistry
@@ -17,10 +18,13 @@ from vscommon.ownership import Ownership
 from vscommon.policy import PolicyRegistry
 from vscommon.provisioning import TenantStore
 from vscommon.queue import DeadLetterQueue, JobQueue, ResultChannel, ResultStream
+from vscommon.quota import DailyQuota
 from vscommon.ratelimit import ConcurrencyLimiter, RateLimiter
 from vscommon.redis_client import create_redis
+from vscommon.rules_control import RulesControl
 from vscommon.shadow import ShadowLedger
 from vscommon.storage import ObjectStore, S3Store, build_store
+from vscommon.tickets import StatusTicketStore, TicketStore
 
 from .config import settings
 
@@ -43,9 +47,23 @@ class AppState:
     concurrency: ConcurrencyLimiter
     shadow: ShadowLedger
     allowlist: Allowlist
+    rule_control: RulesControl
+    """Выключатель отдельного правила: откат без выката (M7.2)."""
+
+    canary: CanaryLedger
+    """Расхождения набора-кандидата с действующим (M7.2)."""
+
     keys: KeyRegistry
     ownership: Ownership
     tenants: TenantStore
+    tickets: TicketStore
+    """Одноразовые талоны на загрузку из браузера (M12.1)."""
+
+    status_tickets: StatusTicketStore
+    """Талоны на наблюдение за сканом из браузера (M12.7)."""
+
+    quota: DailyQuota
+    """Суточный расход публичных ключей (M12.5)."""
 
     async def rules_version(self) -> str:
         """Версия правил и весов; публикуется воркером."""
@@ -129,7 +147,12 @@ async def build_state() -> AppState:
         concurrency=ConcurrencyLimiter(redis, settings.inflight_ttl_s),
         shadow=ShadowLedger(redis),
         allowlist=Allowlist(redis, settings.allowlist_ttl_days),
+        rule_control=RulesControl(redis),
+        canary=CanaryLedger(redis),
         keys=KeyRegistry.load(settings.keys_file),
         ownership=Ownership(redis, settings.verdict_ttl_s),
         tenants=TenantStore(redis),
+        tickets=TicketStore(redis, settings.ticket_ttl_s),
+        status_tickets=StatusTicketStore(redis),
+        quota=DailyQuota(redis),
     )

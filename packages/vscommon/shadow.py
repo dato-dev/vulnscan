@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import collections
 import logging
 import time
 from dataclasses import dataclass, field
@@ -15,11 +16,27 @@ from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
 
-STATS_KEY = "shadow:stats"
-CODES_KEY = "shadow:codes"
-SAMPLES_KEY = "shadow:samples"
+KEY_PREFIX = "shadow"
 MAX_SAMPLES = 200
 CODES_REPORTED = 15
+ALL_TENANTS = "*"
+"""Сводка по всем тенантам. Доступна только администратору (M7.7)."""
+
+
+def keys_of(tenant: str) -> tuple[str, str, str]:
+    """Ключи учёта одного тенанта: счётчики, коды, хвост примеров.
+
+    Тенант в ключе, а не в поле, потому что учёт теневого режима читается
+    целиком: `hgetall` по общему ключу отдал бы соседей вместе со своими. А
+    теневой режим включают по одному тенанту (`TenantPolicy.shadow_mode`) —
+    то есть общая доля «заблокировали бы» описывала бы поток тех, у кого
+    режим включён, и выдавалась бы за долю спрашивающего.
+    """
+    return (
+        f"{KEY_PREFIX}:{tenant}:stats",
+        f"{KEY_PREFIX}:{tenant}:codes",
+        f"{KEY_PREFIX}:{tenant}:samples",
+    )
 
 
 @dataclass(slots=True)
@@ -46,29 +63,79 @@ class ShadowLedger:
     def __init__(self, redis: Redis) -> None:
         self._redis = redis
 
-    async def record(self, verdict: str, would_block: bool, codes: list[str], sha256: str) -> None:
+    async def record(
+        self, tenant: str, verdict: str, would_block: bool, codes: list[str], sha256: str
+    ) -> None:
         """`would_block` — пользователю отказали бы.
 
         Это шире, чем вердикт `malicious`: файл, который не удалось
         пересобрать, до человека тоже не дойдёт.
         """
+        stats_key, codes_key, samples_key = keys_of(tenant)
         pipe = self._redis.pipeline()
-        pipe.hsetnx(STATS_KEY, "since", int(time.time()))
-        pipe.hincrby(STATS_KEY, "total", 1)
-        pipe.hincrby(STATS_KEY, f"verdict:{verdict}", 1)
+        pipe.hsetnx(stats_key, "since", int(time.time()))
+        pipe.hincrby(stats_key, "total", 1)
+        pipe.hincrby(stats_key, f"verdict:{verdict}", 1)
         if would_block:
-            pipe.hincrby(STATS_KEY, "would_block", 1)
+            pipe.hincrby(stats_key, "would_block", 1)
             for code in set(codes):
-                pipe.zincrby(CODES_KEY, 1, code)
+                pipe.zincrby(codes_key, 1, code)
             # Хвост примеров для разбора: sha усечён, содержимое не хранится.
-            pipe.lpush(SAMPLES_KEY, f"{sha256[:12]}:{verdict}")
-            pipe.ltrim(SAMPLES_KEY, 0, MAX_SAMPLES - 1)
+            pipe.lpush(samples_key, f"{sha256[:12]}:{verdict}")
+            pipe.ltrim(samples_key, 0, MAX_SAMPLES - 1)
         await pipe.execute()
 
-    async def report(self) -> ShadowReport:
-        stats = await self._redis.hgetall(STATS_KEY) or {}
-        codes = await self._redis.zrevrange(CODES_KEY, 0, CODES_REPORTED - 1, withscores=True)
-        samples = await self._redis.lrange(SAMPLES_KEY, 0, 19)
+    async def report(self, tenant: str) -> ShadowReport:
+        """Отчёт одного тенанта. `ALL_TENANTS` — сводка по всем.
+
+        Сводка считается сложением, а не отдельным общим счётчиком: второй
+        счётчик того же события пришлось бы держать согласованным, а
+        расходятся такие пары молча.
+        """
+        if tenant == ALL_TENANTS:
+            return await self._aggregate()
+        return await self._report_of(tenant)
+
+    async def tenants(self) -> list[str]:
+        """У кого есть учёт. Нужно администратору для сводки."""
+        prefix = f"{KEY_PREFIX}:"
+        names = [
+            key.removeprefix(prefix).removesuffix(":stats")
+            async for key in self._redis.scan_iter(match=f"{prefix}*:stats", count=100)
+        ]
+        return sorted(names)
+
+    async def _aggregate(self) -> ShadowReport:
+        codes: collections.Counter[str] = collections.Counter()
+        total = would_block = 0
+        since = 0.0
+        by_verdict: collections.Counter[str] = collections.Counter()
+        recent: list[str] = []
+
+        for tenant in await self.tenants():
+            part = await self._report_of(tenant)
+            total += part.total
+            would_block += part.would_block
+            by_verdict.update(part.by_verdict)
+            codes.update(dict(part.top_codes))
+            recent.extend(part.recent_blocks)
+            # Самое раннее начало наблюдения: сводка описывает окно целиком.
+            since = part.since if not since else min(since, part.since or since)
+
+        return ShadowReport(
+            since=since,
+            total=total,
+            would_block=would_block,
+            by_verdict=dict(by_verdict),
+            top_codes=codes.most_common(CODES_REPORTED),
+            recent_blocks=recent[:20],
+        )
+
+    async def _report_of(self, tenant: str) -> ShadowReport:
+        stats_key, codes_key, samples_key = keys_of(tenant)
+        stats = await self._redis.hgetall(stats_key) or {}
+        codes = await self._redis.zrevrange(codes_key, 0, CODES_REPORTED - 1, withscores=True)
+        samples = await self._redis.lrange(samples_key, 0, 19)
 
         return ShadowReport(
             since=float(stats.get("since", 0) or 0),
@@ -83,5 +150,5 @@ class ShadowLedger:
             recent_blocks=list(samples),
         )
 
-    async def reset(self) -> None:
-        await self._redis.delete(STATS_KEY, CODES_KEY, SAMPLES_KEY)
+    async def reset(self, tenant: str) -> None:
+        await self._redis.delete(*keys_of(tenant))

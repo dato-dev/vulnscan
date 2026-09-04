@@ -1,0 +1,117 @@
+{
+  "note": "Фиксированные векторы протокола. Реализация на любом языке обязана давать те же подписи. Секрет здесь тестовый и в бою не используется. Описание протокола — docs/protocol.md.",
+  "algorithm": {
+    "mac": "HMAC-SHA256",
+    "signed_bytes": "utf8(str(timestamp) + \".\" + payload)",
+    "format": "sha256=<hex в нижнем регистре>",
+    "max_skew_s": 300
+  },
+  "canonical_request": [
+    {
+      "method": "POST",
+      "path": "/v1/scan",
+      "key_id": "acme-prod",
+      "bytes_utf8": "POST\n/v1/scan\nacme-prod",
+      "bytes_hex": "504f53540a2f76312f7363616e0a61636d652d70726f64"
+    },
+    {
+      "method": "get",
+      "path": "/v1/scan/2f6a1b7c9d0e4f5a8b3c2d1e0f9a8b7c",
+      "key_id": "acme-prod",
+      "note": "метод приводится к верхнему регистру",
+      "bytes_utf8": "GET\n/v1/scan/2f6a1b7c9d0e4f5a8b3c2d1e0f9a8b7c\nacme-prod",
+      "bytes_hex": "4745540a2f76312f7363616e2f32663661316237633964306534663561386233633264316530663961386237630a61636d652d70726f64"
+    }
+  ],
+  "signatures": [
+    {
+      "name": "upload",
+      "description": "Загрузка файла: подписывается канонический запрос, не тело",
+      "secret": "vector-secret-do-not-use-in-production",
+      "timestamp": 1700000000,
+      "payload_utf8": "POST\n/v1/scan\nacme-prod",
+      "payload_hex": "504f53540a2f76312f7363616e0a61636d652d70726f64",
+      "signature": "sha256=9d7c02f26fb7045703c5d8dc6697922cab03e807806afcc361ad8476e38f2fad"
+    },
+    {
+      "name": "result",
+      "description": "Получение результата по идентификатору",
+      "secret": "vector-secret-do-not-use-in-production",
+      "timestamp": 1700000000,
+      "payload_utf8": "GET\n/v1/scan/2f6a1b7c9d0e4f5a8b3c2d1e0f9a8b7c\nacme-prod",
+      "payload_hex": "4745540a2f76312f7363616e2f32663661316237633964306534663561386233633264316530663961386237630a61636d652d70726f64",
+      "signature": "sha256=513ab11b108a0940b6b2c3b21886d540abcd918d271cda92bfa240d1ea581023"
+    },
+    {
+      "name": "json_body",
+      "description": "Ручка с телом JSON: подписываются байты тела как есть",
+      "secret": "vector-secret-do-not-use-in-production",
+      "timestamp": 1700000000,
+      "payload_utf8": "{\"source\":{\"bucket\":\"vulnscan-raw\",\"key\":\"a/b.pdf\"},\"wait_ms\":400}",
+      "payload_hex": "7b22736f75726365223a7b226275636b6574223a2276756c6e7363616e2d726177222c226b6579223a22612f622e706466227d2c22776169745f6d73223a3430307d",
+      "signature": "sha256=d92069f01e34d8b6dea0ccebe2280f5ca64380a69f1163d122c067b154c9d45f"
+    },
+    {
+      "name": "callback",
+      "description": "Коллбэк: подписываются сырые байты тела до разбора JSON",
+      "secret": "vector-secret-do-not-use-in-production",
+      "timestamp": 1700000000,
+      "payload_utf8": "{\"scan_id\":\"2f6a1b7c9d0e4f5a8b3c2d1e0f9a8b7c\",\"verdict\":\"clean\",\"score\":0}",
+      "payload_hex": "7b227363616e5f6964223a223266366131623763396430653466356138623363326431653066396138623763222c2276657264696374223a22636c65616e222c2273636f7265223a307d",
+      "signature": "sha256=9f3535e6c016d327832ff4a67e2e8397256151c56a1cd812444adf049b27e440"
+    },
+    {
+      "name": "unicode_body",
+      "description": "Кириллица в теле: подписывается UTF-8, а не транслитерация",
+      "secret": "vector-secret-do-not-use-in-production",
+      "timestamp": 1700000000,
+      "payload_utf8": "{\"detail\":\"скан паспорта\"}",
+      "payload_hex": "7b2264657461696c223a22d181d0bad0b0d0bd20d0bfd0b0d181d0bfd0bed180d182d0b0227d",
+      "signature": "sha256=bcf9881047a81490c57bc8b6b0323e17aeab2d78d3218ecc70c94f8abc42f819"
+    },
+    {
+      "name": "empty_payload",
+      "description": "Пустая нагрузка: точка-разделитель обязательна и здесь",
+      "secret": "vector-secret-do-not-use-in-production",
+      "timestamp": 1700000000,
+      "payload_utf8": "",
+      "payload_hex": "",
+      "signature": "sha256=1b13e055d42c050aee91ab3a45b3edb650e1312f04cf3ed70ae5f842acf4a8f6"
+    }
+  ],
+  "verdicts": {
+    "safe": [
+      "clean"
+    ],
+    "flagged": [
+      "suspicious"
+    ],
+    "blocking": [
+      "malicious"
+    ],
+    "unchecked": [
+      "unsupported",
+      "encrypted",
+      "error"
+    ],
+    "note": "Четыре корзины. `suspicious` — проверен, признаки есть, порог блокировки не пройден: решение принимает клиент по своей политике, и именно поэтому вердикт и балл разделены. `unchecked` — файл не проверен; это шире, чем свойство `unscannable` в Python-клиенте, которое покрывает только unsupported и encrypted, тогда как error приходит отдельным путём. Список безопасного положительный: незнакомый вердикт обязан считаться небезопасным. not blocked != safe."
+  },
+  "retryable_status": {
+    "request": [
+      429,
+      500,
+      502,
+      503,
+      504
+    ],
+    "callback_response": [
+      408,
+      425,
+      429,
+      500,
+      502,
+      503,
+      504
+    ]
+  }
+}

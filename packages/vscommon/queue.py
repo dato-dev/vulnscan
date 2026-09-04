@@ -407,6 +407,19 @@ class CallbackQueue:
         return int(await self._redis.zcard(self._retry_key))
 
 
+def _step_back(entry_id: str) -> str:
+    """Идентификатор на единицу меньше — граница следующей страницы.
+
+    `xrevrange` включает границу с обеих сторон, поэтому передать `last`
+    как есть означало бы вечно перечитывать одну и ту же запись. Redis 6.2
+    умеет исключающую границу `(`, но проверять версию сервера ради этого
+    дороже, чем уменьшить номер: формат `<мс>-<порядковый>` стабилен.
+    """
+    ms, _, seq = entry_id.partition("-")
+    number = int(seq or 0)
+    return f"{ms}-{number - 1}" if number else f"{int(ms) - 1}-18446744073709551615"
+
+
 class DeadLetterQueue:
     """Задачи, которые не удалось проверить. Разбираются человеком.
 
@@ -428,17 +441,40 @@ class DeadLetterQueue:
         )
         return entry_id
 
-    async def recent(self, count: int = 50) -> list[DeadLetter]:
-        """Последние записи, новые первыми."""
-        rows = await self._redis.xrevrange(self._stream, count=count)
-        entries: list[DeadLetter] = []
-        for _entry_id, fields in rows:
-            raw = fields.get("entry") or fields.get(b"entry")
-            try:
-                entries.append(DeadLetter.model_validate_json(raw))
-            except ValueError:
-                logger.warning("битая запись в dead-letter, пропускаю")
-        return entries
+    PAGE = 200
+    """Сколько записей читать за раз при отборе по тенанту."""
+
+    async def recent(self, count: int = 50, tenant: str | None = None) -> list[DeadLetter]:
+        """Последние записи, новые первыми. `tenant` — только его.
+
+        Отбор идёт страницами, а не одним чтением на `count`: в общем потоке
+        записи тенантов перемешаны, и первые пятьдесят могли оказаться
+        чужими. Без страниц клиент с редкими отказами видел бы пустой разбор
+        при непустой очереди — то есть отказ, выглядящий как порядок.
+        """
+        found: list[DeadLetter] = []
+        cursor = "+"
+        while len(found) < count:
+            rows = await self._redis.xrevrange(self._stream, max=cursor, count=self.PAGE)
+            if not rows:
+                break
+            for _entry_id, fields in rows:
+                raw = fields.get("entry") or fields.get(b"entry")
+                try:
+                    entry = DeadLetter.model_validate_json(raw)
+                except ValueError:
+                    logger.warning("битая запись в dead-letter, пропускаю")
+                    continue
+                if tenant is not None and entry.tenant != tenant:
+                    continue
+                found.append(entry)
+                if len(found) == count:
+                    break
+
+            if len(rows) < self.PAGE:
+                break
+            cursor = _step_back(str(rows[-1][0]))
+        return found
 
     async def size(self) -> int:
         return int(await self._redis.xlen(self._stream))

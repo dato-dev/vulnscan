@@ -224,75 +224,77 @@ def test_no_panel_exceptions_are_real() -> None:
 # --- версии SDK (M4.16) --------------------------------------------------
 
 ROOT = Path(__file__).parent.parent
-PINS = ROOT / "requirements-telemetry.txt"
-METRIC_PINS = ROOT / "requirements-metrics.txt"
+PYPROJECT = ROOT / "pyproject.toml"
+LOCK = ROOT / "uv.lock"
+
+SDK = re.compile(r"^(opentelemetry-[a-z-]+|prometheus-client)$")
+"""Библиотеки, чью версию мало закрепить локом: она правится осознанно."""
 
 
 def _pinned() -> dict[str, str]:
-    """Закреплённые версии из обоих файлов: пакет → версия."""
-    pins: dict[str, str] = {}
-    for path in (PINS, METRIC_PINS):
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith(("#", "-r")):
-                continue
-            name, version = line.split("==")
-            pins[name] = version
-    return pins
+    """Точные версии SDK из групп `telemetry` и `metrics`: пакет → версия.
 
-
-def test_versions_are_pinned_exactly() -> None:
-    """Никаких `>=` в файлах закрепления.
-
-    Нижняя граница означает, что каждая пересборка образа могла принести
-    другую версию, а какая работает на стенде — выяснялось бы `pip freeze`
-    внутри контейнера.
+    Раньше они лежали в `requirements-telemetry.txt` и
+    `requirements-metrics.txt` — отдельных файлах рядом с `pyproject.toml`.
+    После переезда на `uv.lock` такая пара стала вторым источником правды при
+    одном локе, и файлы убраны: группа в `pyproject.toml` и есть закрепление.
     """
-    loose = [
-        line
-        for path in (PINS, METRIC_PINS)
-        for line in path.read_text().splitlines()
-        if line.strip() and not line.startswith(("#", "-r")) and "==" not in line
-    ]
-
-    assert not loose, f"версия задана не точно: {loose}"
+    text = PYPROJECT.read_text()
+    return {
+        name: version
+        for name, version in re.findall(r'"([a-z][a-z0-9-]*)==([0-9][^"]*)"', text)
+        if SDK.fullmatch(name)
+    }
 
 
-def test_dockerfiles_do_not_name_versions() -> None:
-    """Dockerfile ставит SDK по файлу, а не перечисляет версии сам.
+def test_sdk_versions_are_pinned_exactly() -> None:
+    """У SDK наблюдаемости — `==`, а не `>=`, несмотря на наличие лока.
 
-    Регрессия, ради которой: версии жили в семи местах — pyproject и шесть
-    Dockerfile, — и разъезжались молча. Разошедшиеся версии клиента метрик
-    дают разный формат экспозиции, и Prometheus перестаёт разбирать часть
-    рядов, ничего об этом не сообщая.
+    Лок обеспечивает воспроизводимость: пересборка не принесёт другую версию.
+    Но он же обновляется одной командой, и `>=` означал бы, что версия
+    телеметрии меняется заодно с любым другим обновлением. Расхождение версий
+    телеметрии проявляется не ошибкой, а молча изменившимися именами
+    атрибутов спанов, поэтому её правка должна быть отдельным действием —
+    строкой в `pyproject.toml`, написанной руками.
     """
-    offenders = {}
-    for path in [*ROOT.glob("services/*/Dockerfile"), *ROOT.glob("examples/*/Dockerfile")]:
-        named = [
-            line.strip()
-            for line in path.read_text().splitlines()
-            if not line.lstrip().startswith("#")
-            and re.search(r'"(opentelemetry-[a-z-]+|prometheus-client)[<>=]', line)
-        ]
-        if named:
-            offenders[str(path.relative_to(ROOT))] = named
+    text = PYPROJECT.read_text()
+    loose = re.findall(r'"((?:opentelemetry-[a-z-]+|prometheus-client)[<>~]=[^"]*)"', text)
 
-    assert not offenders, f"версия SDK названа в Dockerfile мимо общего файла: {offenders}"
+    assert not loose, f"версия SDK задана не точно: {loose}"
+    assert _pinned(), "в pyproject не нашлось закреплённых версий SDK"
 
 
-def test_pyproject_matches_the_pins() -> None:
-    """Локальные тесты и образ работают на одном и том же SDK.
+def test_pins_cover_the_whole_sdk() -> None:
+    """Закреплены все три библиотеки трассировки и клиент метрик.
 
-    Разъехавшись, они проверяли бы разный код: расхождение версий телеметрии
-    проявляется не ошибкой, а изменившимися именами атрибутов спанов.
+    Забытая строка не ломается заметно: недостающая библиотека приезжает
+    транзитивно, версией по вкусу разрешателя.
     """
-    text = (ROOT / "pyproject.toml").read_text()
-    declared = dict(re.findall(r'"((?:opentelemetry|prometheus)[a-z-]*)==([0-9][^"]*)"', text))
+    assert set(_pinned()) == {
+        "opentelemetry-api",
+        "opentelemetry-sdk",
+        "opentelemetry-exporter-otlp-proto-http",
+        "prometheus-client",
+    }
 
-    assert declared, "в pyproject не нашлось закреплённых версий телеметрии"
-    assert declared == _pinned(), (
-        f"pyproject и файлы закрепления разошлись: "
-        f"pyproject={declared}, файлы={_pinned()}"
+
+def test_lock_agrees_with_the_pins() -> None:
+    """`uv.lock` содержит ровно закреплённые версии.
+
+    Лок — это то, что действительно поедет в образ. Разойдясь с
+    `pyproject.toml`, он собрал бы образ на версии, которой никто не называл,
+    и заметить это можно было бы только изнутри контейнера.
+    """
+    lock = LOCK.read_text()
+    missing = {
+        name: version
+        for name, version in _pinned().items()
+        if f'name = "{name}"\nversion = "{version}"' not in lock
+    }
+
+    assert not missing, (
+        f"лок не содержит закреплённых версий: {missing}. "
+        "После правки pyproject нужен `make lock`."
     )
 
 

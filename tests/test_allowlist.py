@@ -72,14 +72,14 @@ async def test_entry_expires(allowlist) -> None:
 
 async def test_expired_entry_is_not_returned(allowlist) -> None:
     await allowlist.add(_entry(), ttl_days=1)
-    await allowlist._redis.delete(Allowlist._key(SHA))  # имитация истечения
+    await allowlist._redis.delete(Allowlist._key(ANY_TENANT, SHA))  # имитация истечения
 
     assert await allowlist.get(SHA, None) is None
 
 
 async def test_index_cleaned_after_expiry(allowlist) -> None:
     await allowlist.add(_entry(), ttl_days=1)
-    await allowlist._redis.delete(Allowlist._key(SHA))
+    await allowlist._redis.delete(Allowlist._key(ANY_TENANT, SHA))
 
     assert await allowlist.entries() == []
 
@@ -134,7 +134,7 @@ async def test_entries_sorted_by_expiry(allowlist) -> None:
 
 
 async def test_corrupted_entry_ignored(allowlist) -> None:
-    await allowlist._redis.set(Allowlist._key(SHA), "{не json")
+    await allowlist._redis.set(Allowlist._key(ANY_TENANT, SHA), "{не json")
 
     assert await allowlist.get(SHA, None) is None
 

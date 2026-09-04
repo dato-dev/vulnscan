@@ -46,6 +46,12 @@ SCANNER_URL = os.environ.get("SCANNER_URL", "http://gateway:8080")
 KEY_ID = os.environ.get("SCANNER_KEY_ID", "")
 SECRET = os.environ.get("SCANNER_SECRET", "")
 
+# Адрес сканера, видимый БРАУЗЕРУ. Отличается от `SCANNER_URL`: тот —
+# внутренний, для вызовов сервер-серверу, и снаружи не резолвится.
+SCANNER_PUBLIC_URL = os.environ.get("SCANNER_PUBLIC_URL", "http://localhost:8080")
+SITE_KEY = os.environ.get("SCANNER_SITE_KEY", "")
+"""Публичный ключ сайта. Лежит в HTML открыто — так и задумано."""
+
 MAX_BYTES = 16 * 1024 * 1024
 
 POLL_ATTEMPTS = 6
@@ -287,6 +293,120 @@ async def _fetch_clean(outcome: object) -> str:
         return ""
     _clean_files[scan_id] = (clean, "application/pdf")
     return f'<br><a href="/clean/{html.escape(scan_id)}">Скачать безопасную копию</a>'
+
+
+WIDGET_PAGE = """<!doctype html>
+<meta charset="utf-8">
+<title>Обратная связь через виджет</title>
+<style>
+  :root {{ color-scheme: light dark; }}
+  body {{ font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto;
+         padding: 0 1.5rem; line-height: 1.6; }}
+  h1 {{ font-size: 1.6rem; margin-bottom: .3rem; }}
+  .sub {{ color: #666; margin-top: 0; }}
+  label {{ display: block; margin-top: 1.1rem; font-weight: 600; font-size: .9rem; }}
+  input, textarea {{ width: 100%; padding: .55rem; font: inherit;
+                     border: 1px solid #bbb; border-radius: 6px; background: transparent;
+                     color: inherit; }}
+  textarea {{ min-height: 6rem; }}
+  button {{ margin-top: 1.4rem; padding: .6rem 1.4rem; font: inherit; font-weight: 600;
+            border: 0; border-radius: 6px; background: #2f4f82; color: #fff; cursor: pointer; }}
+  .box {{ margin-top: 1.6rem; padding: 1rem 1.2rem; border-radius: 8px; border-left: 4px solid; }}
+  .ok {{ border-color: #2c7256; background: #2c725618; }}
+  .warn {{ border-color: #9a6b12; background: #9a6b1218; }}
+  .bad {{ border-color: #a03a30; background: #a03a3018; }}
+  .meta {{ color: #666; font-size: .85rem; margin-top: .6rem; }}
+</style>
+
+<h1>Напишите нам</h1>
+<p class="sub">Вложение проверяется виджетом: файл идёт прямо в сканер, наш сервер
+его не видит.</p>
+
+<form method="post" action="/widget-feedback">
+  <label>Ваше имя<input name="name" required maxlength="80"></label>
+  <label>Сообщение<textarea name="message" required maxlength="2000"></textarea></label>
+
+  <label>Вложение (PDF)</label>
+  <!-- Вся интеграция — этот блок и один скрипт. Оформление задаётся
+       атрибутами: сервис принимает только известные переменные и только
+       проверенные значения, поэтому чужой CSS сюда не попадает. -->
+  <div data-vulnscan-key="{site_key}"
+       data-vulnscan-accent="#2f4f82"
+       data-vulnscan-radius="6px"
+       data-vulnscan-size="15px"></div>
+  <script src="{scanner}/widget/v1/loader.js" async></script>
+
+  <button type="submit">Отправить</button>
+</form>
+{result}
+"""
+
+
+@app.get("/widget", response_class=HTMLResponse)
+async def widget_form() -> str:
+    """Вторая форма — через виджет, для сравнения с первой.
+
+    Разница видна по коду: здесь нет ни чтения файла, ни обращения к сканеру
+    на приёме. Файл уходит из браузера прямо в сканер, минуя этот сервер.
+    """
+    if not SITE_KEY:
+        return "<p>Задайте SCANNER_SITE_KEY — публичный ключ сайта.</p>"
+    return WIDGET_PAGE.format(site_key=html.escape(SITE_KEY), scanner=SCANNER_PUBLIC_URL, result="")
+
+
+@app.post("/widget-feedback", response_class=HTMLResponse)
+async def widget_submit(
+    name: str = Form(...),
+    message: str = Form(...),
+    vulnscan_scan_id: str = Form(""),
+    vulnscan_state: str = Form(""),
+) -> str:
+    """Приём формы от виджета.
+
+    ГЛАВНОЕ ЗДЕСЬ — вердикт запрашивается у сканера **своим ключом**. Всё, что
+    пришло в полях формы, включая `vulnscan_state` и сам идентификатор,
+    написал браузер посетителя: он отправит что угодно.
+
+    Поля из формы годятся ровно на одно — объяснить посетителю, что случилось,
+    когда вложения нет. Решение принимается по ответу сканера.
+    """
+    who = html.escape(name[:80])
+    page = lambda box: WIDGET_PAGE.format(  # noqa: E731
+        site_key=html.escape(SITE_KEY), scanner=SCANNER_PUBLIC_URL, result=box
+    )
+
+    if not vulnscan_scan_id:
+        # Вложения нет. Почему — подскажет состояние, но верить ему можно
+        # только для текста сообщения.
+        excuse = {
+            "blocked": "Вложение заблокировано проверкой.",
+            "unchecked": "Вложение не удалось проверить.",
+            "busy": "Проверка ещё не закончилась.",
+        }.get(vulnscan_state, "Сообщение принято без вложения.")
+        return page(_box("ok" if not vulnscan_state else "warn", f"Спасибо, {who}! {excuse}"))
+
+    try:
+        async with _client() as client:
+            outcome = await client.result(vulnscan_scan_id)
+    except VulnscanError:
+        logger.warning("сканер недоступен на проверке результата")
+        return page(_box("warn", "Не смогли подтвердить проверку вложения. Попробуйте позже."))
+
+    if outcome is None:
+        # Идентификатор не наш или устарел. Ровно то, что придёт, если его
+        # подобрали или подставили руками.
+        logger.warning("предъявлен неизвестный scan_id")
+        return page(_box("bad", "Вложение не найдено. Приложите файл заново."))
+
+    if outcome.pending:
+        return page(_box("warn", "Вложение ещё проверяется, отправьте форму через минуту."))
+    if outcome.blocked:
+        return page(_box("bad", "Вложение заблокировано."))
+    if not outcome.safe:
+        # `not blocked` и `safe` — разные вещи.
+        return page(_box("warn", "Вложение не удалось проверить, принять его нельзя."))
+
+    return page(_box("ok", f"Спасибо, {who}! Вложение проверено и принято."))
 
 
 @app.get("/metrics")

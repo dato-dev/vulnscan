@@ -6,9 +6,11 @@ import asyncio
 import contextlib
 import logging
 import signal
+from collections import deque
 
 from vscommon.allowlist import Allowlist, audit_line
 from vscommon.cache import AvCache, StructuralCache, weights_key_for
+from vscommon.canary import CanaryLedger
 from vscommon.freshness import HOUR, Freshness, age_of, parse_clamav_built_at
 from vscommon.hashing import short
 from vscommon.journal import AttemptJournal
@@ -43,6 +45,7 @@ from vscommon.queue import (
 )
 from vscommon.ratelimit import ConcurrencyLimiter
 from vscommon.redis_client import create_redis
+from vscommon.rules_control import RulesControl
 from vscommon.shadow import ShadowLedger
 from vscommon.storage import S3Store, build_store
 from vscommon.telemetry import (
@@ -60,6 +63,14 @@ from .reclaim import StuckJobReclaimer
 from .scoring import verdict_on_failure
 
 logger = logging.getLogger(__name__)
+
+CANARY_BUFFER = 5_000
+"""Сколько расхождений канарейки держать до сброса в Redis.
+
+Верхняя граница на память: расхождения приходят со скоростью проверок, а
+сбрасываются раз в `reload_interval_s`. Переполнение считается отдельным
+исходом в метрике — потерянные наблюдения делают кандидата чище, чем он есть.
+"""
 
 
 class Worker:
@@ -81,6 +92,15 @@ class Worker:
         self._concurrency = ConcurrencyLimiter(self._redis, settings.inflight_ttl_s)
         self._shadow = ShadowLedger(self._redis)
         self._allowlist = Allowlist(self._redis, settings.allowlist_ttl_days)
+        self._rule_control = RulesControl(self._redis)
+        self._canary = CanaryLedger(self._redis)
+        # Стадия работает в пуле потоков, а журнал асинхронный. Поэтому
+        # расхождения складываются в буфер и уезжают в Redis из цикла
+        # перезагрузки: сетевой вызов из горячего пути обошёлся бы дороже
+        # самой проверки, а `run_coroutine_threadsafe` завёл бы задачу на файл.
+        self._canary_buffer: deque[tuple[str, frozenset[str], frozenset[str]]] = deque(
+            maxlen=CANARY_BUFFER
+        )
         self._reclaimer = StuckJobReclaimer(
             queue=self._queue,
             heartbeat=self._heartbeat,
@@ -129,6 +149,13 @@ class Worker:
                 "reclaim_min_idle_s": settings.reclaim_min_idle_s,
             },
         )
+        # ДО первой задачи, а не в цикле перезагрузки. Цикл спит перед первым
+        # тиком, и без этой строки перезапущенный воркер полминуты работал бы
+        # с правилом, которое выключили из-за массовых ложных срабатываний, —
+        # то есть откат отменялся бы рестартом.
+        await self._apply_rule_control()
+        self._pipeline.observe_canary_with(self._observe_canary)
+
         reclaim_task = asyncio.create_task(self._reclaim_loop())
         reload_task = asyncio.create_task(self._reload_loop())
 
@@ -201,6 +228,9 @@ class Worker:
             await asyncio.sleep(settings.reload_interval_s)
             try:
                 changed = await asyncio.to_thread(self._pipeline.reload_config)
+                changed |= await self._apply_rule_control()
+                await asyncio.to_thread(self._pipeline.reload_candidate)
+                await self._flush_canary()
             except Exception:
                 logger.exception("сбой при перезагрузке конфигурации")
                 continue
@@ -213,6 +243,41 @@ class Worker:
                     "конфигурация обновлена без рестарта",
                     extra={"rules_version": self._pipeline.rules_version},
                 )
+
+    def _observe_canary(
+        self, sha256: str, active: frozenset[str], candidate: frozenset[str]
+    ) -> None:
+        """Вызывается из пула потоков. Только положить в очередь, ничего больше."""
+        if len(self._canary_buffer) == self._canary_buffer.maxlen:
+            # `deque` вытесняет молча, а молчаливая потеря наблюдений делает
+            # кандидата чище, чем он есть, — то есть подталкивает выкатить.
+            metrics().canary_runs.labels(outcome="dropped").inc()
+        self._canary_buffer.append((sha256, active, candidate))
+
+    async def _flush_canary(self) -> None:
+        """Сбрасывает накопленные расхождения. Отказ Redis их теряет, и это
+        приемлемо: канарейка — наблюдение, а не результат проверки."""
+        while self._canary_buffer:
+            sha256, active, candidate = self._canary_buffer.popleft()
+            try:
+                await self._canary.record(sha256, active, candidate)
+            except Exception:
+                logger.warning("не удалось записать расхождение канарейки", exc_info=True)
+                return
+
+    async def _apply_rule_control(self) -> bool:
+        """Забирает список выключенных правил (M7.2).
+
+        Недоступный Redis здесь не должен ослаблять проверку: прежний список
+        остаётся в силе, а не сбрасывается в пустой. Сброс означал бы, что
+        сетевой сбой сам собой включает обратно правило, которое выключили
+        из-за массовых ложных срабатываний.
+        """
+        try:
+            return self._pipeline.apply_rule_control(await self._rule_control.disabled())
+        except Exception:
+            logger.exception("не удалось прочитать список выключенных правил")
+            return False
 
     async def _spawn(
         self, entry_id: str, job: ScanJob, abandoned: bool = False, delivered: int = 0
@@ -492,6 +557,7 @@ class Worker:
                 job.mode is not ScanMode.DETECT and result.sanitized is None
             )
             await self._shadow.record(
+                tenant=job.policy.tenant,
                 verdict=result.verdict.value,
                 would_block=refused,
                 codes=[f.code for f in result.findings if f.score > 0],

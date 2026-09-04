@@ -70,8 +70,16 @@ def collect(directory: Path = DB_DIR) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Своими средствами, а не через `vscommon.logging`: этот образ собран на
+    # alpine вокруг чужой утилиты и общий код не тянет. Версия в логе всё
+    # равно обязана быть — вопрос «что сейчас работает» одинаков для всех.
+    logger.info(
+        "экспортёр зеркала запускается: образ %s, порт %s, каталог %s",
+        os.environ.get("IMAGE_TAG", "").strip() or "unknown",
+        PORT,
+        DB_DIR,
+    )
     start_http_server(PORT)
-    logger.info("экспортёр зеркала слушает %s, каталог %s", PORT, DB_DIR)
 
     while True:
         try:

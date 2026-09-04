@@ -1,5 +1,6 @@
-.PHONY: help venv up down logs test test-integration lint fmt typecheck samples smoke \
-        corpus corpus-check findings-doc buildx-setup images push release
+.PHONY: help venv lock up down logs test test-integration lint fmt typecheck samples smoke \
+        corpus corpus-check rules-check findings-doc buildx-setup images push release \
+        config config-check check-stack
 
 # Локальный venv используется, если он есть: системный python может быть старее 3.12.
 PY := $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
@@ -16,6 +17,11 @@ PROJECT    ?= vulnscantg
 TAG        ?= $(shell git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d-%H%M)
 PLATFORMS  ?= linux/amd64
 SERVICES   ?= gateway worker bot cvdmirror writer notifier
+
+# Пример подключения лежит вне `services/`: это не часть сервиса, а показ того,
+# как к нему подключаются, и у него свой compose. Правило сборки общее, поэтому
+# путь до Dockerfile выбирается здесь, а не дублируется отдельной целью.
+dockerfile = $(if $(filter demo-site,$*),examples/feedback-site/Dockerfile,services/$*/Dockerfile)
 BUILDER    ?= vulnscan
 
 # Docker Hub не поддерживает вложенные пространства имён, поэтому сервис
@@ -32,7 +38,7 @@ images: $(addprefix image-,$(SERVICES))  ## Собрать образы под P
 
 image-%:
 	docker buildx build --platform $(PLATFORMS) \
-		-f services/$*/Dockerfile \
+		-f $(dockerfile) \
 		-t $(image_name):$(TAG) -t $(image_name):latest \
 		--cache-to type=inline --cache-from $(image_name):latest \
 		.
@@ -41,7 +47,7 @@ push: guard-NAMESPACE $(addprefix push-,$(SERVICES))  ## Собрать и за�
 
 push-%:
 	docker buildx build --platform $(PLATFORMS) \
-		-f services/$*/Dockerfile \
+		-f $(dockerfile) \
 		-t $(image_name):$(TAG) -t $(image_name):latest \
 		--cache-to type=inline --cache-from $(image_name):latest \
 		--push .
@@ -59,11 +65,12 @@ guard-%:
 	@test -n "$($*)" || { echo "не задано $*: make push NAMESPACE=ваш-аккаунт"; exit 1; }
 
 venv:  ## Создать локальное окружение для тестов и линта (нужен uv)
-	uv venv --python 3.12 .venv
-	uv pip install --python .venv/bin/python -e ".[dev]" || \
-		uv pip install --python .venv/bin/python \
-			pydantic pydantic-settings pikepdf pillow redis httpx fastapi \
-			python-multipart pytest pytest-asyncio ruff mypy
+	# Ровно то, что записано в uv.lock, без запасного варианта. Прежний
+	# `|| uv pip install <список руками>` тихо ставил урезанный набор, когда
+	# основная установка падала, — и локальный прогон оказывался не тем, что
+	# в образе. Так yara-python не стоял ни у кого: правила не компилировал
+	# никто, а тесты были зелёными.
+	uv sync --frozen --all-groups
 
 up:  ## Поднять стек (первый старт долгий: clamd тянет базы)
 	docker compose up --build -d
@@ -116,6 +123,18 @@ corpus:  ## Скачать корпус реальных PDF (см. corpus/READM
 
 corpus-check:  ## Регрессия на ложные срабатывания по корпусу
 	$(PY) corpus/check.py $(if $(API),--api $(API),)
+
+lock:  ## Пересчитать uv.lock после правки зависимостей в pyproject.toml
+	uv lock
+
+rules-check:  ## Шлюз YARA-правил: компиляция и прогон по корпусу (нужен yara-python)
+	$(PY) rules/check.py $(if $(COMPILE_ONLY),--compile-only,)
+
+config:  ## Настроить keys.json, weights.json, policies.json (диалог в консоли)
+	$(PY) deploy/configure.py $(if $(CONFIG_DIR),--config-dir $(CONFIG_DIR),) $(CMD)
+
+config-check:  ## Проверить конфигурацию загрузчиками сервиса, ничего не меняя
+	$(PY) deploy/configure.py $(if $(CONFIG_DIR),--config-dir $(CONFIG_DIR),) check
 
 samples:  ## Сгенерировать тестовые файлы
 	$(PY) samples/make_samples.py

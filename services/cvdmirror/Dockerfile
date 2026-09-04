@@ -6,13 +6,25 @@
 # выходе в интернет: наружу ходит только этот контейнер.
 FROM python:3.12-alpine
 
-COPY requirements-metrics.txt /tmp/requirements-metrics.txt
+# uv приезжает готовым бинарником из своего образа, а не ставится pip'ом.
+# Здесь берётся musl-сборка: базовый образ alpine, и glibc-бинарник в нём не
+# запустится — причём ошибка будет невнятной, вида «not found» на существующем
+# файле.
+COPY --from=ghcr.io/astral-sh/uv:0.11.25-alpine /usr/local/bin/uv /usr/local/bin/uv
 
-# `cvdupdate` тянется отдельно: он не про наблюдаемость, а prometheus-client
-# берётся из общего файла, чтобы версия совпадала с остальными образами.
-RUN adduser -D -u 10001 cvd \
-    && pip install --no-cache-dir "cvdupdate>=1.1" \
-    && pip install --no-cache-dir -r /tmp/requirements-metrics.txt \
+# Зависимости — из общего `uv.lock`, группа `cvdmirror` плюс `metrics`.
+# Раньше `cvdupdate` назывался версией прямо здесь, а клиент Prometheus
+# приезжал отдельным файлом: два источника на один образ. Теперь один.
+#
+# Клиент метрик обязан совпадать по версии с остальными образами: разъехавшись,
+# они дают разный формат экспозиции, и Prometheus молча перестаёт разбирать
+# часть рядов.
+COPY pyproject.toml uv.lock /tmp/build/
+RUN uv export --frozen --no-default-groups --group cvdmirror --group metrics \
+        --project /tmp/build -o /tmp/requirements.txt \
+    && adduser -D -u 10001 cvd \
+    && uv pip install --system --no-cache -r /tmp/requirements.txt \
+    && rm -rf /tmp/build /tmp/requirements.txt \
     && mkdir -p /db \
     && chown -R cvd:cvd /db
 

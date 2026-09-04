@@ -1,0 +1,23 @@
+{
+  "name": "vulnscan-client",
+  "version": "0.1.0",
+  "description": "Клиент сервиса проверки вложений vulnscantg",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": ["index.js", "index.d.ts", "README.md"],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "scripts": {
+    "vectors": "node scripts/check-vectors.js"
+  },
+  "license": "UNLICENSED"
+}

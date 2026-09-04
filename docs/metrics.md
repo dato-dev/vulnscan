@@ -127,6 +127,8 @@ Prometheus на весь срок хранения. Ограничение де�
 | `vs_rules_age_seconds` | gauge | `kind` | Свежесть конфигурации |
 | `vs_config_reloads_total` | counter | `kind`, `outcome` | Перезагрузка правил и весов на живом сервисе |
 | `vs_rules_loaded` | gauge | `kind` | Сколько правил в работе; ноль — стадия без правил |
+| `vs_rules_disabled` | gauge | | Правил выключено вручную (M7.2); не ноль — детект ослаблен |
+| `vs_rules_canary_total` | counter | `outcome` | Прогоны набора-кандидата (M7.2): `agree`, `candidate_only`, `active_only`, `failed` |
 | `vs_degraded` | gauge | `component` | Компонент в урезанном режиме |
 | `vs_input_bytes` | histogram | `profile` | Размер входа; объясняет уехавший p95 |
 | `vs_history_lag_seconds` | histogram | — | От завершения скана до записи в историю |

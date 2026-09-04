@@ -1,0 +1,73 @@
+# Шлюз для YARA-правил (ROADMAP M7.1).
+#
+# Зачем это отдельным конвейером, а не строкой в общем прогоне. Правило,
+# которое не компилируется, воркер НЕ роняет: он пишет `WARNING`, остаётся на
+# прежнем наборе и продолжает работать. Решение верное, но снаружи оно
+# неотличимо от исправной работы — вердикты выдаются, метрики растут, и только
+# новое правило не действует. Поймать это можно лишь до выкатки.
+#
+# Порядок шагов от дешёвого к дорогому: контракт правил (секунды, без
+# библиотеки) → компиляция и синтетика (десятки секунд) → прогон по корпусу
+# (минуты и сеть). Ошибку в теге незачем ждать три минуты.
+
+name: rules
+
+on:
+  pull_request:
+    paths:
+      - "rules/**"
+      - "packages/vscommon/weights.py"
+      - "services/worker/worker_app/stages/yara_rules.py"
+      - ".github/workflows/rules.yml"
+  push:
+    branches: [main]
+    paths:
+      - "rules/**"
+      - "packages/vscommon/weights.py"
+      - "services/worker/worker_app/stages/yara_rules.py"
+  workflow_dispatch:
+
+jobs:
+  rules:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Поставить uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          # Та же версия, что закреплена в Dockerfile. Установщик — часть
+          # состава окружения: разойдясь, он даст другое дерево зависимостей
+          # при том же локе, и проявится это не здесь, а на стенде.
+          version: "0.11.25"
+
+      - name: Окружение
+        # Из того же лока, что и образы. `--frozen`: лок не пересчитывается,
+        # иначе конвейер проверял бы не то, что поедет в сборку.
+        run: uv sync --frozen --all-groups
+
+      - name: Контракт правил
+        # Теги, описания, имена, двойники. Без yara-python: эта часть обязана
+        # работать и там, где библиотека не собралась.
+        run: .venv/bin/python -m pytest tests/test_yara_contract.py -q
+
+      - name: Компиляция и синтетика
+        run: |
+          .venv/bin/python samples/make_samples.py
+          make rules-check
+
+      - name: Корпус
+        # Бюджет меньше локального: полнота детекта здесь не измеряется, важны
+        # ложные срабатывания, а они ловятся и на выборке.
+        run: make corpus BUDGET_MB=60
+
+      - name: Регрессия на ложные срабатывания
+        run: |
+          make rules-check
+          make corpus-check

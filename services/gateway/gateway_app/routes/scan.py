@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import tempfile
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import (
@@ -29,12 +30,31 @@ from vscommon.callbacks import CallbackRejectedError, validate_callback
 from vscommon.hashing import short
 from vscommon.keys import AccessKey
 from vscommon.models import ScanRequest, ScanResult, Verdict
+from vscommon.policy import upload_limit_for
 
-from ..auth import require_key, require_signed_body
+from ..auth import (
+    ORIGIN_HEADER,
+    require_key,
+    require_key_or_ticket,
+    require_signed_body,
+    require_site_key,
+)
 from ..ingest import Ingestor
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["scan"])
+
+
+def _seconds_until_utc_midnight() -> int:
+    """Сколько ждать до обнуления суточной квоты.
+
+    Считается по UTC, потому что по UTC считается и сама квота. Отдавать в
+    `Retry-After` минуту, как при обычном превышении частоты, здесь неверно:
+    через минуту счётчик будет тем же, и клиент сходит впустую.
+    """
+    now = datetime.now(UTC)
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1, int((midnight - now).total_seconds()))
 
 
 def _state(request: Request):
@@ -48,7 +68,7 @@ async def scan_upload(
     file: UploadFile = File(...),
     meta: str = Form("{}"),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    key: AccessKey = Depends(require_key),
+    key: AccessKey = Depends(require_key_or_ticket),
 ) -> ScanResult:
     """Приём файла multipart.
 
@@ -85,11 +105,116 @@ async def scan_upload(
 
     # Контекст трассировки клиента: без него дерево рвётся на HTTP-границе и
     # «что делал бот» и «что делал сервис» оказываются разными трейсами.
+    ticket = getattr(request.state, "ticket", None)
     result, synchronous = await Ingestor(_state(request)).ingest_upload(
-        file, scan_request, idempotency_key, request.headers.get("traceparent")
+        file,
+        scan_request,
+        idempotency_key,
+        request.headers.get("traceparent"),
+        max_bytes=ticket.max_bytes if ticket is not None else None,
     )
     response.status_code = status.HTTP_200_OK if synchronous else status.HTTP_202_ACCEPTED
+
+    if ticket is not None and not synchronous:
+        # Загрузка из браузера не уложилась в отведённое время. Прочитать
+        # вердикт фрейм не может — для этого нужна подпись, — а без ответа
+        # посетитель остаётся с «ещё проверяется» навсегда.
+        #
+        # Выдаём предмет ровно на одно: наблюдать за ЭТИМ сканом. Ни вердикта
+        # чужого скана, ни файла он не даёт. Заголовком, а не полем ответа:
+        # `ScanResult` — публичная модель, и класть в неё то, что нужно одному
+        # способу подключения, значит менять контракт ради частного случая.
+        token, ttl = await _state(request).status_tickets.issue(result.scan_id, key.tenant)
+        response.headers["X-Vulnscan-Status-Ticket"] = token
+        response.headers["X-Vulnscan-Status-TTL"] = str(ttl)
+
     return result
+
+
+@router.post("/tickets", status_code=status.HTTP_201_CREATED)
+async def issue_ticket(request: Request, response: Response) -> dict[str, object]:
+    """Выдаёт одноразовый талон на загрузку одного файла (M12.1, M12.3).
+
+    Два пути получения, и оба ведут к одному предмету.
+
+    **Подписанным запросом** — бэкенд сайта просит талон своим секретным
+    ключом и отдаёт его в браузер. Секрет при этом остаётся на сервере.
+
+    **Публичным ключом сайта** — запрос идёт прямо из браузера, ключ лежит в
+    HTML, а вместо подписи проверяется `Origin`. Так работает виджет: сайту не
+    нужен ни бэкенд, ни знание протокола.
+
+    Талон не даёт ничего, кроме одной загрузки: ни чтения результата, ни
+    скачивания обезвреженной копии.
+    """
+    if request.headers.get(ORIGIN_HEADER):
+        # Есть Origin — значит запрос из браузера, и ключ должен быть
+        # публичным. Пробовать сначала подпись здесь нельзя: браузер её не
+        # поставит, и клиент получил бы отказ про подпись вместо внятного
+        # ответа про ключ сайта.
+        key = await require_site_key(request)
+        origin = request.headers.get(ORIGIN_HEADER, "")
+        # Ответ адресный: заголовок отдаётся тому origin, который проверен, а
+        # не `*`. Со звёздочкой ответ прочитала бы любая страница.
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    else:
+        await require_signed_body(request)
+        key = request.state.access_key
+        origin = ""
+
+    state = _state(request)
+    policy = state.policies.for_tenant(key.tenant)
+
+    if key.public:
+        # Два разных ограничения, и оба нужны (M12.5).
+        #
+        # Частота — по ИДЕНТИФИКАТОРУ КЛЮЧА, а не по тенанту: общее ведро
+        # означало бы, что наплыв через виджет вытесняет собственные вызовы
+        # сайта, то есть наша защита ломает клиента.
+        rate = await state.rate_limiter.check(
+            f"public:{key.key_id}", policy.public_rate_limit_per_min
+        )
+        if not rate.allowed:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "превышена частота выдачи талонов",
+                headers={"Retry-After": str(rate.retry_after_s)},
+            )
+
+        # Суточная квота — про стоимость, а не про нагрузку. Шестьдесят
+        # запросов в минуту это восемьдесят шесть тысяч файлов в сутки, и
+        # ограничение частоты такой поток считает совершенно штатным.
+        if not await state.quota.spend(key.key_id, policy.public_daily_tickets):
+            logger.warning(
+                "суточная квота публичного ключа исчерпана",
+                extra={"key_id": key.key_id, "лимит": policy.public_daily_tickets},
+            )
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "суточная квота исчерпана",
+                # До полуночи UTC: раньше счётчик не обнулится, и предлагать
+                # зайти через минуту значит звать на бесполезный круг.
+                headers={"Retry-After": str(_seconds_until_utc_midnight())},
+            )
+
+    # Предел размера — из политики тенанта, а не из запроса. Клиент, способный
+    # выписать себе талон на гигабайт, — это способ разорить владельца ключа.
+    max_bytes = upload_limit_for(policy)
+
+    ticket, ttl = await state.tickets.issue(
+        tenant=key.tenant, key_id=key.key_id, max_bytes=max_bytes, origin=origin
+    )
+    logger.info(
+        "выдан талон на загрузку",
+        extra={
+            "tenant": key.tenant,
+            "ttl_s": ttl,
+            "лимит_байт": max_bytes,
+            "из_браузера": bool(origin),
+        },
+    )
+    return {"ticket": ticket.token, "expires_in": ttl, "max_bytes": max_bytes}
 
 
 @router.post("/scan/ref", response_model=ScanResult)

@@ -6,9 +6,11 @@ import hashlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from vscommon import rules_control as control
 from vscommon.limits import STAGE_TIMEOUT_S
 from vscommon.metrics import metrics
 
@@ -16,6 +18,14 @@ from ..config import settings
 from .base import ScanContext, Stage
 
 logger = logging.getLogger(__name__)
+
+CanaryObserver = Callable[[str, frozenset[str], frozenset[str]], None]
+"""Куда уходит расхождение кандидата с действующим набором.
+
+Аргументы: sha256 файла, что нашёл действующий набор, что нашёл кандидат.
+Вызывается синхронно из пула потоков, поэтому обязан быть дешёвым: сеть,
+блокировки и обращения к диску отсюда запрещены.
+"""
 
 WEIGHT_TAGS = ("critical", "high", "medium", "low")
 """Тег правила задаёт вес через ключ `YARA:<тег>` в таблице весов."""
@@ -44,22 +54,73 @@ class YaraStage(Stage):
         self._compiled = rules is not None
         self._fingerprint: str | None = None
         self._stat_signature: tuple[tuple[str, int, int], ...] | None = None
+        self._disabled: frozenset[str] = frozenset()
+        self._candidate: Any = None
+        self._candidate_signature: tuple[tuple[str, int, int], ...] | None = None
         self._lock = threading.Lock()
+        self._observer: CanaryObserver | None = None
 
     @property
     def rules_fingerprint(self) -> str:
         """Отпечаток набора правил: входит в ключ структурного кэша.
 
-        Считается по содержимому файлов, а не по скомпилированному объекту, —
-        поэтому не зависит от того, дошло ли дело до компиляции, и меняется
+        Содержимое файлов считается, а не скомпилированный объект: так
+        отпечаток не зависит от того, дошло ли дело до компиляции, и меняется
         ровно тогда, когда меняются сами правила.
+
+        Выключенные правила (M7.2) входят сюда же, и это обязательно. Иначе
+        выключение не обесценило бы кэш: файл, проверенный час назад,
+        продолжал бы отдаваться с признаком от правила, которого больше нет в
+        работе.
         """
         if self._fingerprint is None:
             self._fingerprint = self._content_fingerprint()
-        return self._fingerprint
+        return f"{self._fingerprint}{control.fingerprint(self._disabled)}"
+
+    @property
+    def disabled_rules(self) -> frozenset[str]:
+        return self._disabled
+
+    def observe_with(self, observer: CanaryObserver | None) -> None:
+        """Куда складывать расхождения кандидата с действующим набором.
+
+        Наблюдатель необязателен: без него канарейка считается только
+        метриками. Стадия работает в пуле потоков, поэтому наблюдатель обязан
+        быть синхронным и быстрым — никаких сетевых вызовов из горячего пути.
+        """
+        self._observer = observer
+
+    def apply_control(self, disabled: frozenset[str]) -> bool:
+        """Принимает список выключенных правил. Возвращает, изменился ли он.
+
+        Компиляции не требует: правила остаются скомпилированными, отсекаются
+        их совпадения. Так выключение действует и на правило, которое сейчас
+        не перечитать, — а именно в такие минуты им и пользуются.
+        """
+        if disabled == self._disabled:
+            return False
+
+        with self._lock:
+            self._disabled = disabled
+
+        if disabled:
+            # На каждой перезагрузке, а не однократно: выключенное и забытое
+            # правило — это дыра, и напоминать о ней должно регулярно.
+            logger.warning(
+                "правила выключены вручную и не участвуют в проверке",
+                extra={"rules": sorted(disabled)},
+            )
+        else:
+            logger.info("выключенных правил нет")
+        metrics().rules_disabled.set(len(disabled))
+        return True
 
     def _rule_files(self) -> list[Path]:
         return sorted(Path(settings.yara_rules_dir).glob("*.yar"))
+
+    def _candidate_files(self) -> list[Path]:
+        directory = settings.yara_candidate_dir
+        return sorted(Path(directory).glob("*.yar")) if directory else []
 
     def _content_fingerprint(self) -> str:
         digest = hashlib.sha256()
@@ -107,11 +168,15 @@ class YaraStage(Stage):
             # Отметку не двигаем: попробуем ещё раз, когда файлы поправят.
             return False
 
+        candidate = self._compile_candidate()
+
         with self._lock:
             self._rules = compiled
             self._compiled = True
             self._fingerprint = fingerprint
             self._stat_signature = stat_signature
+            self._candidate = candidate
+            self._candidate_signature = self._candidate_stat_signature()
 
         logger.info("правила YARA перезагружены", extra={"fingerprint": fingerprint})
         metrics().config_reloads.labels(kind="yara", outcome="applied").inc()
@@ -131,8 +196,33 @@ class YaraStage(Stage):
             # же проверка после touch перекомпилировала бы правила впустую.
             self._stat_signature = self._current_stat_signature()
             self._fingerprint = self._content_fingerprint()
+            self._candidate = self._compile_candidate()
+            self._candidate_signature = self._candidate_stat_signature()
         self._report_rules()
         return self._rules
+
+    def _candidate_stat_signature(self) -> tuple[tuple[str, int, int], ...]:
+        return tuple(
+            (path.name, path.stat().st_size, int(path.stat().st_mtime_ns))
+            for path in self._candidate_files()
+        )
+
+    def reload_candidate_if_changed(self) -> bool:
+        """Кандидата правят чаще действующего набора — ради этого он и есть.
+
+        Отдельно от `reload_if_changed`, потому что менять их вместе значило
+        бы, что правка кандидата обесценивает структурный кэш. Кандидат на
+        вердикт не влияет, в отпечаток не входит, кэш трогать не должен.
+        """
+        signature = self._candidate_stat_signature()
+        if signature == self._candidate_signature:
+            return False
+
+        candidate = self._compile_candidate()
+        with self._lock:
+            self._candidate = candidate
+            self._candidate_signature = signature
+        return True
 
     def _compile(self) -> Any:
         import yara
@@ -144,6 +234,41 @@ class YaraStage(Stage):
 
         compiled = yara.compile(filepaths=sources)
         logger.info("правила YARA скомпилированы", extra={"count": len(sources)})
+        return compiled
+
+    def _compile_candidate(self) -> Any:
+        """Кандидат на выкатку (M7.2). Отсутствует — значит канарейки нет.
+
+        Не компилируется — канарейка просто не работает, и это `WARNING`, а не
+        отказ: набор-кандидат по определению сырой, и ронять им проверку файлов
+        было бы ровно наоборот тому, ради чего он заведён.
+        """
+        directory = settings.yara_candidate_dir
+        files = self._candidate_files()
+        if not files:
+            if directory:
+                # Каталог задан, а правил в нём нет. Молчать здесь нельзя:
+                # снаружи это неотличимо от работающей канарейки, которая не
+                # нашла расхождений, — то есть от «кандидат хорош, выкатывай».
+                logger.warning(
+                    "канарейка настроена, но правил-кандидатов нет",
+                    extra={"dir": directory},
+                )
+                metrics().rules_loaded.labels(kind="yara_candidate").set(0)
+            return None
+
+        import yara
+
+        try:
+            compiled = yara.compile(filepaths={p.stem: str(p) for p in files})
+        except Exception:
+            logger.exception("набор-кандидат не компилируется, канарейка выключена")
+            metrics().config_reloads.labels(kind="yara_candidate", outcome="failed").inc()
+            return None
+
+        logger.info("набор-кандидат скомпилирован", extra={"count": len(files)})
+        metrics().config_reloads.labels(kind="yara_candidate", outcome="applied").inc()
+        metrics().rules_loaded.labels(kind="yara_candidate").set(len(files))
         return compiled
 
     def _report_rules(self) -> None:
@@ -173,8 +298,20 @@ class YaraStage(Stage):
         with self._lock:
             matches = rules.match(str(ctx.path), timeout=int(STAGE_TIMEOUT_S["yara"]))
 
-        ctx.engines["yara"] = {"status": "ok", "matches": len(matches)}
-        for match in matches:
+        # Отсев после сопоставления, а не до: правило остаётся
+        # скомпилированным, и включить его обратно — снова одна строка в
+        # Redis, без чтения файлов и без риска, что набор в этот момент не
+        # компилируется.
+        kept = [match for match in matches if match.rule not in self._disabled]
+        suppressed = len(matches) - len(kept)
+
+        ctx.engines["yara"] = {"status": "ok", "matches": len(kept)}
+        if suppressed:
+            # В `engines` это видно клиенту и в истории: иначе разбор старого
+            # скана не объяснить — правило было, признака нет.
+            ctx.engines["yara"]["suppressed"] = suppressed
+
+        for match in kept:
             tag = next((t for t in match.tags if t in WEIGHT_TAGS), DEFAULT_TAG)
             ctx.add(
                 self.name,
@@ -182,3 +319,42 @@ class YaraStage(Stage):
                 match.rule,
                 weight_key=f"YARA:{tag}",
             )
+
+        self._run_candidate(ctx, active={match.rule for match in kept})
+
+    def _run_candidate(self, ctx: ScanContext, active: set[str]) -> None:
+        """Прогон набора-кандидата вхолостую (M7.2).
+
+        Совпадения кандидата НЕ попадают ни в признаки, ни в `engines`, ни
+        в кэш. Это не осторожность, а определение: набор, способный изменить
+        вердикт, — не канарейка, а выкатка на долю трафика. Кандидат заводят,
+        чтобы узнать цену выкатки, и узнать её должно быть безопасно.
+
+        Отсюда и обработка ошибок: что бы кандидат ни сделал, проверка файла
+        уже состоялась, и портить её результат нельзя.
+        """
+        candidate = self._candidate
+        if candidate is None:
+            return
+
+        try:
+            with self._lock:
+                matches = candidate.match(str(ctx.path), timeout=int(STAGE_TIMEOUT_S["yara"]))
+            found = {match.rule for match in matches}
+        except Exception:
+            logger.warning("набор-кандидат не отработал на файле", exc_info=True)
+            metrics().canary_runs.labels(outcome="failed").inc()
+            return
+
+        if found == active:
+            metrics().canary_runs.labels(outcome="agree").inc()
+        else:
+            # Две стороны расхождения означают разное. Лишнее у кандидата —
+            # будущие ложные срабатывания, пропавшее — потерянный детект.
+            if found - active:
+                metrics().canary_runs.labels(outcome="candidate_only").inc()
+            if active - found:
+                metrics().canary_runs.labels(outcome="active_only").inc()
+
+        if self._observer is not None and found != active:
+            self._observer(ctx.job.sha256, frozenset(active), frozenset(found))

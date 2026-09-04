@@ -28,6 +28,15 @@ services:
       vulnscan_egress:
 
     environment:
+      # Чем помечен образ при сборке — процессу это знать неоткуда,
+      # а вопрос «что сейчас работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG:-latest}
+      # Публичный ключ сайта: лежит в HTML открыто, подписать им нельзя.
+      SCANNER_SITE_KEY: ${SCANNER_SITE_KEY:-}
+      # Адрес сканера ГЛАЗАМИ БРАУЗЕРА. Внутреннее имя `gateway` снаружи не
+      # резолвится, и виджет молча не загрузится — в консоли будет ошибка сети,
+      # а на странице пустое место.
+      SCANNER_PUBLIC_URL: ${SCANNER_PUBLIC_URL:-http://localhost:8080}
       SCANNER_URL: http://gateway:8080
       SCANNER_KEY_ID: ${DEMO_KEY_ID:?задайте DEMO_KEY_ID в .env}
       SCANNER_SECRET: ${DEMO_SECRET:?задайте DEMO_SECRET в .env}

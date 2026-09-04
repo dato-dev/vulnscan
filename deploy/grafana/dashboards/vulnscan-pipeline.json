@@ -612,6 +612,48 @@
           "placement": "bottom"
         }
       }
+    },
+    {
+      "type": "timeseries",
+      "title": "Канареечный набор правил",
+      "description": "Набор-кандидат прогоняется вхолостую рядом с действующим (M7.2): на вердикт он не влияет, поэтому по вердиктам его не видно вовсе — только здесь.\n\n`candidate_only` — файлы, которые кандидат пометил бы, а действующий набор нет: это будущие ложные срабатывания, и решение о выкатке принимается по ним.\n`active_only` — детект, который выкатка потеряет.\n\nПусто — обычное состояние: канарейки нет, YARA_CANDIDATE_DIR не задан. Пустота во время выкатки означает, что кандидат не скомпилировался — смотрите vs_config_reloads_total{kind=\"yara_candidate\"}.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(vs_rules_canary_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Канарейки нет — обычное состояние. Во время выкатки пустота значит, что кандидат не скомпилировался.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
     }
   ]
 }

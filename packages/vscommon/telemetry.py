@@ -19,6 +19,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Final
 
+from .version import VERSION
+
 logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover — зависит от окружения, обе ветки проверяются тестами
@@ -96,7 +98,7 @@ def setup_tracing(
     enabled: bool = True,
     endpoint: str = "",
     sample_ratio: float = 1.0,
-    version: str = "0.1.0",
+    version: str = VERSION,
 ) -> bool:
     """Настраивает экспорт трассировок. Вызывается один раз на старте процесса.
 

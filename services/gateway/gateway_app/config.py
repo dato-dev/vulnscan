@@ -4,6 +4,14 @@ from vscommon.config import CommonSettings
 
 
 class GatewaySettings(CommonSettings):
+    ticket_ttl_s: int = 300
+    """Срок жизни талона на загрузку.
+
+    Пять минут: посетитель успевает выбрать файл, а талон, утёкший из браузера,
+    протухает раньше, чем им успеют воспользоваться всерьёз. Верхняя граница
+    жёстко ограничена в `vscommon.tickets`, и поднять её отсюда нельзя.
+    """
+
     service_name: str = "gateway"
     host: str = "0.0.0.0"
     port: int = 8080

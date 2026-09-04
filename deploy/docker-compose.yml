@@ -14,6 +14,9 @@ services:
     image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-gateway:${IMAGE_TAG:-latest}
     env_file: [.env]
     environment:
+      # Чем помечен образ при сборке — процессу это знать неоткуда,
+      # а вопрос «что сейчас работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG:-latest}
       PYTHONPATH: /app
       POLICY_FILE: /app/config/policies.json
       WEIGHTS_FILE: /app/config/weights.json
@@ -55,6 +58,9 @@ services:
     image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-worker:${IMAGE_TAG:-latest}
     env_file: [.env]
     environment:
+      # Чем помечен образ при сборке — процессу это знать неоткуда,
+      # а вопрос «что сейчас работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG:-latest}
       METRICS_PORT: "9100"
       PYTHONPATH: /app
       POLICY_FILE: /app/config/policies.json
@@ -97,6 +103,9 @@ services:
     image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-worker:${IMAGE_TAG:-latest}
     env_file: [.env]
     environment:
+      # Чем помечен образ при сборке — процессу это знать неоткуда,
+      # а вопрос «что сейчас работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG:-latest}
       METRICS_PORT: "9100"
       PYTHONPATH: /app
       WORKER_MODE: deep
@@ -138,6 +147,9 @@ services:
       lgtp:
     image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-bot:${IMAGE_TAG:-latest}
     environment:
+      # Чем помечен образ при сборке — процессу это знать неоткуда,
+      # а вопрос «что сейчас работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG:-latest}
       PYTHONPATH: /app
       SCANNER_URL: http://gateway:8080
       TENANT: telegram-bot
@@ -207,6 +219,9 @@ services:
       - path: proxy.env
         required: false
     environment:
+      # Чем помечен образ при сборке — процессу это знать неоткуда,
+      # а вопрос «что сейчас работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG:-latest}
       PYTHONPATH: /app
       KEYS_FILE: /app/config/keys.json
       METRICS_PORT: "9103"
@@ -225,6 +240,9 @@ services:
     image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-writer:${IMAGE_TAG:-latest}
     env_file: [.env]
     environment:
+      # Чем помечен образ при сборке — процессу это знать неоткуда,
+      # а вопрос «что сейчас работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG:-latest}
       PYTHONPATH: /app
       METRICS_PORT: "9101"
     depends_on:
@@ -297,6 +315,9 @@ services:
       - path: proxy.env
         required: false
     environment:
+      # Чем помечен образ при сборке — процессу это знать неоткуда,
+      # а вопрос «что сейчас работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG:-latest}
       CVD_DB_DIR: /db
       CVD_PORT: "8000"
       # Явно, как всем: умолчание из кода перебивается общим .env (M10.9).

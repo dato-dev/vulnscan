@@ -39,7 +39,7 @@ from .stages.base import ScanContext, Stage
 from .stages.clamav import ClamavStage
 from .stages.filetype import FiletypeStage
 from .stages.structure import StructureStage
-from .stages.yara_rules import YaraStage
+from .stages.yara_rules import CanaryObserver, YaraStage
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,31 @@ class Pipeline:
     def _reload_rules(self) -> bool:
         stage = next((s for s in self._stages if hasattr(s, "reload_if_changed")), None)
         return bool(stage and stage.reload_if_changed())
+
+    def reload_candidate(self) -> bool:
+        """Перекомпилирует набор-кандидат, если его правили (M7.2).
+
+        Отдельно от `reload_config`: кандидат на вердикт не влияет и в
+        отпечаток не входит, а `reload_config` своим результатом сообщает
+        «версия правил сменилась».
+        """
+        stage = next((s for s in self._stages if hasattr(s, "reload_candidate_if_changed")), None)
+        return bool(stage and stage.reload_candidate_if_changed())
+
+    def observe_canary_with(self, observer: CanaryObserver) -> None:
+        stage = next((s for s in self._stages if hasattr(s, "observe_with")), None)
+        if stage is not None:
+            stage.observe_with(observer)
+
+    def apply_rule_control(self, disabled: frozenset[str]) -> bool:
+        """Список выключенных правил (M7.2). Возвращает, изменился ли он.
+
+        Отдельно от `reload_config`, потому что источник другой: правила
+        лежат файлами, а выключатель — в Redis. Смешивать их значило бы
+        сделать выключатель заложником доступности файлов.
+        """
+        stage = next((s for s in self._stages if hasattr(s, "apply_control")), None)
+        return bool(stage and stage.apply_control(disabled))
 
     def _reload_weights(self) -> bool:
         path = settings.weights_file

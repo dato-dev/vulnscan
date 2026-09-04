@@ -18,6 +18,8 @@ from typing import Any, Final
 
 from vscommon.telemetry import current_ids
 
+from .version import build_info
+
 _EMPTY: Final[Mapping[str, Any]] = MappingProxyType({})
 
 _context: contextvars.ContextVar[Mapping[str, Any]] = contextvars.ContextVar(
@@ -91,7 +93,15 @@ class ConsoleFormatter(logging.Formatter):
 
 
 def setup_logging(service: str, level: str = "INFO", fmt: str = "console") -> None:
-    """Конфигурирует root-логгер. Вызывается один раз на старте процесса."""
+    """Конфигурирует root-логгер и сообщает версию сборки.
+
+    Версия пишется здесь, а не в каждом `main`, по одной причине: строчку,
+    которую надо не забыть добавить в шесть мест, однажды забудут добавить в
+    седьмом. А обнаружится это тогда же, когда она понадобится, — при разборе
+    аварии, у того самого сервиса, который и сломался.
+
+    Вызывается один раз на старте процесса.
+    """
     formatter: logging.Formatter = JsonFormatter(service) if fmt == "json" else ConsoleFormatter()
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(formatter)
@@ -106,6 +116,10 @@ def setup_logging(service: str, level: str = "INFO", fmt: str = "console") -> No
     for noisy in ("botocore", "boto3", "urllib3", "s3transfer", "httpx", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger("uvicorn.access").disabled = True
+
+    # Первая запись в жизни процесса. Отвечает на вопрос «что сейчас
+    # работает», который возникает ровно тогда, когда что-то сломалось.
+    logging.getLogger(__name__).info("сервис запускается", extra=build_info())
 
 
 @contextmanager

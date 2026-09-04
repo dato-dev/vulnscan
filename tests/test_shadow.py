@@ -117,6 +117,9 @@ def test_shadow_without_artifact_is_not_deliverable() -> None:
 # --- учёт ---
 
 
+TENANT = "team-a"
+
+
 @pytest.fixture()
 async def ledger():
     redis = aioredis.FakeRedis(decode_responses=True)
@@ -125,11 +128,11 @@ async def ledger():
 
 
 async def test_ledger_counts_what_would_be_blocked(ledger) -> None:
-    await ledger.record("clean", False, [], "a" * 64)
-    await ledger.record("clean", False, [], "b" * 64)
-    await ledger.record("malicious", True, ["PDF_LAUNCH"], "c" * 64)
+    await ledger.record(TENANT, "clean", False, [], "a" * 64)
+    await ledger.record(TENANT, "clean", False, [], "b" * 64)
+    await ledger.record(TENANT, "malicious", True, ["PDF_LAUNCH"], "c" * 64)
 
-    report = await ledger.report()
+    report = await ledger.report(TENANT)
 
     assert report.total == 3
     assert report.would_block == 1
@@ -140,10 +143,10 @@ async def test_ledger_counts_what_would_be_blocked(ledger) -> None:
 async def test_ledger_ranks_codes_behind_blocks(ledger) -> None:
     """По какому признаку блокировок больше всего — первый вопрос при разборе."""
     for _ in range(3):
-        await ledger.record("malicious", True, ["PDF_LAUNCH", "PDF_JS"], "a" * 64)
-    await ledger.record("malicious", True, ["POLYGLOT_ARCHIVE"], "b" * 64)
+        await ledger.record(TENANT, "malicious", True, ["PDF_LAUNCH", "PDF_JS"], "a" * 64)
+    await ledger.record(TENANT, "malicious", True, ["POLYGLOT_ARCHIVE"], "b" * 64)
 
-    top = dict((await ledger.report()).top_codes)
+    top = dict((await ledger.report(TENANT)).top_codes)
 
     assert top["PDF_LAUNCH"] == 3
     assert top["POLYGLOT_ARCHIVE"] == 1
@@ -151,9 +154,9 @@ async def test_ledger_ranks_codes_behind_blocks(ledger) -> None:
 
 async def test_ledger_keeps_no_file_content(ledger) -> None:
     """В журнале только усечённый хэш: содержимое туда попадать не должно."""
-    await ledger.record("malicious", True, ["PDF_LAUNCH"], "a" * 64)
+    await ledger.record(TENANT, "malicious", True, ["PDF_LAUNCH"], "a" * 64)
 
-    (sample,) = (await ledger.report()).recent_blocks
+    (sample,) = (await ledger.report(TENANT)).recent_blocks
 
     assert sample == f"{'a' * 12}:malicious"
     assert len(sample.split(":")[0]) == 12
@@ -161,22 +164,22 @@ async def test_ledger_keeps_no_file_content(ledger) -> None:
 
 async def test_refusal_counts_more_than_malicious(ledger) -> None:
     """Файл, который не удалось пересобрать, пользователю тоже не отдадут."""
-    await ledger.record("clean", False, [], "a" * 64)
-    await ledger.record("malicious", True, ["PDF_LAUNCH"], "b" * 64)
+    await ledger.record(TENANT, "clean", False, [], "a" * 64)
+    await ledger.record(TENANT, "malicious", True, ["PDF_LAUNCH"], "b" * 64)
     # unsupported: вердикт не malicious, но копии нет — значит отказ
-    await ledger.record("unsupported", True, ["TYPE_UNKNOWN"], "c" * 64)
+    await ledger.record(TENANT, "unsupported", True, ["TYPE_UNKNOWN"], "c" * 64)
 
-    report = await ledger.report()
+    report = await ledger.report(TENANT)
 
     assert report.total == 3
     assert report.would_block == 2, "отказ по невозможности пересобрать тоже считается"
 
 
 async def test_ledger_reset(ledger) -> None:
-    await ledger.record("malicious", True, ["PDF_LAUNCH"], "a" * 64)
-    await ledger.reset()
+    await ledger.record(TENANT, "malicious", True, ["PDF_LAUNCH"], "a" * 64)
+    await ledger.reset(TENANT)
 
-    report = await ledger.report()
+    report = await ledger.report(TENANT)
 
     assert report.total == 0 and report.would_block == 0
 

@@ -66,10 +66,18 @@ class Ingestor:
         request: ScanRequest,
         idempotency_key: str | None = None,
         traceparent: str | None = None,
+        max_bytes: int | None = None,
     ) -> tuple[ScanResult, bool]:
-        """Приём multipart-файла. Возвращает (результат, синхронный_ли_ответ)."""
+        """Приём multipart-файла. Возвращает (результат, синхронный_ли_ответ).
+
+        `max_bytes` приходит из талона (M12.1) и **сужает** предел политики, а
+        не заменяет его. Иначе талон, выписанный когда-то на больший размер,
+        пережил бы ужесточение политики и остался лазейкой.
+        """
         policy = self._state.policies.for_tenant(request.tenant)
         size_limit = upload_limit_for(policy)
+        if max_bytes is not None:
+            size_limit = min(size_limit, max_bytes)
 
         hasher = StreamHasher()
         with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as buffer:
