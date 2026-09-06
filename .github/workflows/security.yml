@@ -52,14 +52,14 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Раннер свой и живёт долго: без этого токен останется лежать в
           # .git/config рабочего каталога до следующего запуска.
           persist-credentials: false
 
       - name: Поставить uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v10
         with:
           # Та же версия, что в rules.yml и в Dockerfile. Нужен ради uvx:
           # bandit и semgrep запускаются им, в uv.lock их нет и не надо.
@@ -101,7 +101,7 @@ jobs:
         # артефакт с полным SBOM и деревом зависимостей доступен каждому, у
         # кого есть доступ к репозиторию, и живёт дольше, чем нужно.
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: security-reports
           path: .security-reports/
