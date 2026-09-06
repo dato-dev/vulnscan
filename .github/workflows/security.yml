@@ -74,14 +74,18 @@ jobs:
 
       - name: Проверки и заливка в DefectDojo
         env:
-          DD_URL: ${{ secrets.DD_URL }}
+          # Переменная, а не секрет: секреты GitHub маскирует в логах, и
+          # адрес в выводе стал бы `***` — разбирать по нему, куда ушла
+          # заливка, невозможно. Секретность здесь и не нужна: хост виден
+          # любому, у кого есть доступ к этому приватному репозиторию.
+          DD_URL: ${{ vars.DD_URL }}
           DD_TOKEN: ${{ secrets.DD_TOKEN }}
           IMAGE_TAG: ${{ inputs.image_tag || 'latest' }}
-          # Учётные данные реестра отдаём trivy напрямую, а не через
-          # `docker login`: тот пишет их в ~/.docker/config.json раннера, где
-          # они переживут прогон и достанутся следующей задаче.
-          TRIVY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
-          TRIVY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          # Учётных данных реестра здесь нет: образы dato1/vulnscantg-* на
+          # Docker Hub публичные, trivy тянет их анонимно. Если реестр станет
+          # приватным — добавьте TRIVY_USERNAME и TRIVY_PASSWORD из секретов,
+          # но не `docker login`: тот пишет их в ~/.docker/config.json
+          # раннера, где они переживут прогон и достанутся следующей задаче.
           # Отчёты кладём в рабочий каталог, чтобы приложить их к разбору,
           # если что-то упадёт.
           DD_REPORT_DIR: ${{ github.workspace }}/.security-reports
