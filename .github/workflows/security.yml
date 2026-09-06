@@ -59,7 +59,10 @@ jobs:
           persist-credentials: false
 
       - name: Поставить uv
-        uses: astral-sh/setup-uv@v10
+        # Полная версия, а не мажорная: astral-sh перестали двигать
+        # скользящие теги после v7, и `@v10` не существует — конвейер падает
+        # на этапе разрешения экшенов, до единого шага.
+        uses: astral-sh/setup-uv@v10.0.1
         with:
           # Та же версия, что в rules.yml и в Dockerfile. Нужен ради uvx:
           # bandit и semgrep запускаются им, в uv.lock их нет и не надо.
