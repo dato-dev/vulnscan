@@ -74,6 +74,18 @@ DD_SAST_ENGAGEMENT=${DD_SAST_ENGAGEMENT:-sast}
 DD_SEMGREP_CONFIG=${DD_SEMGREP_CONFIG:-"p/python p/security-audit"}
 # Что скармливать bandit: он умеет только Python.
 DD_BANDIT_PATHS=${DD_BANDIT_PATHS:-"services packages"}
+# Python, на котором uvx запускает SAST. Не косметика: под 3.9 в окружение
+# semgrep приезжает старая opentelemetry-instrumentation, которая импортирует
+# pkg_resources, а его в venv от uv нет — semgrep падает на старте. Плюс
+# bandit разбирает код модулем ast того интерпретатора, на котором запущен:
+# на 3.9 файл с синтаксисом 3.12 не распарсится и уедет в errors, то есть
+# будет молча не проверен. Версия та же, на которой работает сам сервис.
+DD_SAST_PYTHON=${DD_SAST_PYTHON:-3.12}
+# Версии закреплены по той же причине, что trivy и правила YARA: состав
+# находок зависит от версии сканера, и плавающая даст скачок в дашборде,
+# который будут разбирать как настоящий.
+DD_BANDIT_SPEC=${DD_BANDIT_SPEC:-bandit==1.9.4}
+DD_SEMGREP_SPEC=${DD_SEMGREP_SPEC:-semgrep==1.176.1}
 
 SERVICES_ALL="gateway worker bot notifier writer cvdmirror"
 TARGETS_DEFAULT="$SERVICES_ALL repo sast"
@@ -234,11 +246,15 @@ sbom() {  # режим цель продукт service имя-файла мет�
 # Инструмент с PATH, иначе через uvx. pip в этом репозитории запрещён, а
 # тащить bandit и semgrep в uv.lock ради CI — значит поставить их в окружение,
 # которое собирает образы.
-sast_cmd() {  # имя -> команда запуска или пусто
-    if command -v "$1" >/dev/null 2>&1; then
-        echo "$1"
-    elif command -v uvx >/dev/null 2>&1; then
-        echo "uvx $1"
+# uvx впереди PATH намеренно. Инструмент с PATH — это чужая версия на чужом
+# интерпретаторе: на раннере ей оказался системный python 3.9, и semgrep не
+# стартовал вовсе. uvx даёт закреплённую версию на закреплённом Python, то
+# есть один и тот же состав находок локально и в CI.
+sast_cmd() {  # спецификация имя -> команда запуска или пусто
+    if command -v uvx >/dev/null 2>&1; then
+        echo "uvx --python $DD_SAST_PYTHON --from $1 $2"
+    elif command -v "$2" >/dev/null 2>&1; then
+        echo "$2"
     else
         echo ""
     fi
@@ -261,9 +277,9 @@ run_sast() {  # метка файл команда...
 }
 
 scan_sast() {
-    cmd=$(sast_cmd bandit)
+    cmd=$(sast_cmd "$DD_BANDIT_SPEC" bandit)
     if [ -z "$cmd" ]; then
-        bad "bandit недоступен — поставьте uv (для uvx) или сам bandit"
+        bad "bandit недоступен — нужен uv (для uvx) или bandit в PATH"
     else
         out="$work/bandit.json"
         # --exit-zero: иначе находки неотличимы от сбоя запуска.
@@ -272,9 +288,9 @@ scan_sast() {
             && push "vulnscantg-repo" "repo" "$out" "Bandit Scan" "$DD_SAST_ENGAGEMENT"
     fi
 
-    cmd=$(sast_cmd semgrep)
+    cmd=$(sast_cmd "$DD_SEMGREP_SPEC" semgrep)
     if [ -z "$cmd" ]; then
-        bad "semgrep недоступен — поставьте uv (для uvx) или сам semgrep"
+        bad "semgrep недоступен — нужен uv (для uvx) или semgrep в PATH"
         return 0
     fi
     out="$work/semgrep.json"
