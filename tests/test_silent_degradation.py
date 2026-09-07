@@ -406,6 +406,9 @@ class _StubWorker:
     async def _maybe_enqueue_deep(self, job: Any, result: Any) -> None:
         return None
 
+    async def _enqueue_delivery(self, job: Any, result: Any) -> None:
+        return None
+
 
 class _StubResults:
     async def publish(self, result: Any, status_ttl_s: int | None = None) -> None:

@@ -12,7 +12,7 @@ from collections import deque
 from vscommon.allowlist import Allowlist, audit_line
 from vscommon.cache import AvCache, StructuralCache, weights_key_for
 from vscommon.canary import CanaryLedger
-from vscommon.freshness import HOUR, Freshness, age_of, parse_clamav_built_at
+from vscommon.freshness import HOUR, Age, Freshness, age_of, parse_clamav_built_at
 from vscommon.hashing import short
 from vscommon.journal import AttemptJournal
 from vscommon.logging import log_context, setup_logging
@@ -138,6 +138,8 @@ class Worker:
         self._semaphore = asyncio.Semaphore(settings.concurrency)
         self._tasks: set[asyncio.Task[None]] = set()
         self._stopping = asyncio.Event()
+        self._av_freshness: Freshness | None = None
+        """Последнее известное состояние баз антивируса — чтобы писать о смене."""
 
     async def start(self) -> None:
         await self._queue.ensure_group()
@@ -487,7 +489,7 @@ class Worker:
                     await self._results.publish(completed)
                     if job.callback_url:
                         await self._enqueue_callback(job, completed)
-                        await self._enqueue_delivery(job, completed)
+                    await self._enqueue_delivery(job, completed)
                     await self._queue.ack(entry_id)
                     return
 
@@ -710,7 +712,16 @@ class Worker:
 
         if job.callback_url:
             await self._enqueue_callback(job, result)
-            await self._enqueue_delivery(job, result)
+        # Выгрузка копии НЕ зависит от того, просил ли клиент вебхук. Она
+        # зависела, и это не проявлялось ошибкой: клиент, получающий вердикт
+        # ответом на запрос (`200` в пределах `wait_ms`), коллбэк не заказывает
+        # — и его файлы не доезжали до приёмника вовсе, тихо. Снаружи это
+        # выглядит как «часть файлов почему-то не приходит»: те, что проверились
+        # быстро, теряются, те, что ушли в `202`, доезжают.
+        #
+        # Приёмник — свойство политики тенанта, а коллбэк — свойство запроса.
+        # Связывать их значит отдавать серверную настройку на решение клиенту.
+        await self._enqueue_delivery(job, result)
 
     async def _store_cache(self, job: ScanJob, result: ScanResult) -> None:
         """Раскладывает результат по двум уровням.
@@ -824,7 +835,7 @@ class Worker:
         await self._results.store_status(result, ttl_s=settings.dlq_status_ttl_s)
         if job.callback_url:
             await self._enqueue_callback(job, result)
-            await self._enqueue_delivery(job, result)
+        await self._enqueue_delivery(job, result)
         await self._concurrency.release(job.tenant or "default", job.scan_id)
 
     async def _publish_engine_version(self) -> None:
@@ -855,11 +866,35 @@ class Worker:
                 expired_after_s=settings.av_db_expired_after_h * HOUR,
             )
             metrics().rules_age.labels(kind="av_db").set(age.seconds or 0.0)
-            if age.state is not Freshness.FRESH:
-                logger.warning(
-                    "базы антивируса устарели",
-                    extra={"возраст_ч": age.hours, "состояние": age.state.value},
-                )
+            self._report_av_freshness(age)
+
+    def _report_av_freshness(self, age: Age) -> None:
+        """Пишет о свежести баз на СМЕНЕ состояния, а не на каждом тике.
+
+        Публикация версии идёт по таймеру, и предупреждение на каждом тике
+        давало десятки тысяч одинаковых строк в сутки. Это не «шумно»: журнал,
+        в котором предупреждения идут сплошным потоком при исправной работе,
+        учит их не читать — а следующее будет о чём-то другом. Непрерывный
+        сигнал здесь и так есть, это метрика `rules_age`; лог должен отмечать
+        событие.
+
+        Возврат к свежим базам пишется тоже: иначе в журнале осталась бы
+        проблема, которая никогда не кончилась.
+        """
+        previous = self._av_freshness
+        self._av_freshness = age.state
+        if age.state is previous:
+            return
+
+        if age.state is Freshness.FRESH:
+            if previous is not None:
+                logger.info("базы антивируса снова свежие", extra={"возраст_ч": age.hours})
+            return
+
+        logger.warning(
+            "базы антивируса устарели",
+            extra={"возраст_ч": age.hours, "состояние": age.state.value},
+        )
 
     async def stop(self) -> None:
         logger.info("остановка воркера")

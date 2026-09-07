@@ -268,6 +268,71 @@ def test_worker_complains_about_a_broken_destination() -> None:
     assert "logger.error" in source
 
 
+class _Recorder:
+    """Ровно те поля `Worker`, которых касается `_deliver`.
+
+    Метод зовётся несвязанным: поднимать настоящий `Worker` значит поднять
+    Redis, хранилище и конвейер. Проверяется здесь не он, а место вызова.
+    """
+
+    def __init__(self) -> None:
+        self.callbacks: list[str] = []
+        self.deliveries: list[str] = []
+        self._results = _Silent()
+        self._concurrency = _Silent()
+
+    @staticmethod
+    def _observe_verdict(job: Any, result: Any) -> None:
+        return None
+
+    async def _record_history(self, job: Any, result: Any) -> None:
+        return None
+
+    async def _store_cache(self, job: Any, result: Any) -> None:
+        return None
+
+    async def _maybe_enqueue_deep(self, job: Any, result: Any) -> None:
+        return None
+
+    async def _enqueue_callback(self, job: Any, result: Any) -> None:
+        self.callbacks.append(result.scan_id)
+
+    async def _enqueue_delivery(self, job: Any, result: Any) -> None:
+        self.deliveries.append(result.scan_id)
+
+
+class _Silent:
+    async def publish(self, result: Any, status_ttl_s: int | None = None) -> None:
+        return None
+
+    async def release(self, tenant: str, scan_id: str) -> None:
+        return None
+
+
+async def test_copy_travels_without_a_webhook() -> None:
+    """Выгрузка не зависит от того, заказал ли клиент коллбэк.
+
+    Зависела — и это не проявлялось ошибкой. Клиент, получающий вердикт
+    ответом на запрос (`200` в пределах `wait_ms`), коллбэк не заказывает, и
+    его файлы не доезжали до приёмника вообще. Снаружи выглядит так, будто
+    «часть файлов почему-то не приходит»: быстрые теряются, ушедшие в `202`
+    доезжают. Ровно это и показал сквозной стенд (M13.0), где ни один из
+    восьми файлов не появился в бакете при исправных логах.
+
+    Приёмник — свойство политики тенанта, коллбэк — свойство запроса.
+    """
+    from worker_app.main import Worker
+
+    worker = _Recorder()
+    job = _job()
+    assert job.callback_url is None, "проверка потеряла смысл: коллбэк в задании есть"
+
+    await Worker._deliver(worker, job, _result())
+
+    assert worker.deliveries == ["01J-скан"], "копия не поставлена в очередь выгрузки"
+    assert worker.callbacks == [], "коллбэк никто не заказывал"
+
+
 def test_worker_does_not_upload_anything_itself() -> None:
     """У воркера нет сетевого выхода наружу — и не должно появиться.
 

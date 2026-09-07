@@ -151,3 +151,106 @@ def test_unparsable_output_fails_verification(tmp_path: Path) -> None:
     broken.write_bytes(b"%PDF-1.7\n" + b"\xff" * 500)
 
     assert "unparsable" in PdfSanitizer().verify(broken)
+
+
+# --- профиль strict: растеризация ------------------------------------------
+
+
+def _fake_ghostscript(monkeypatch: pytest.MonkeyPatch, pages: int = 2) -> list[list[str]]:
+    """Подменяет ghostscript тем, что он и делает: рисует страницы в JPEG.
+
+    Настоящий gs есть в образе воркера, но не на машине разработчика, и
+    единственным местом проверки оставался сквозной стенд. Здесь подделан
+    ровно внешний инструмент — сборка PDF, лимиты и верификация настоящие.
+
+    Подделка рисует страницы ТОЛЬКО когда её позвали растровым устройством.
+    Возврат к `-sDEVICE=pdfwrite` — то есть к передистилляции вместо
+    растеризации — не даст ни одного файла, и тест упадёт сам.
+    """
+    import io
+
+    from PIL import Image
+
+    from worker_app.cdr import pdf as pdf_module
+
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> object:
+        calls.append(argv)
+        device = next((a for a in argv if a.startswith("-sDEVICE=")), "")
+        output = next((a for a in argv if a.startswith("-sOutputFile=")), "")
+        template = output.removeprefix("-sOutputFile=")
+
+        if device == "-sDEVICE=jpeg" and "%05d" in template:
+            frame = Image.new("RGB", (300, 400), (250, 250, 245))
+            for number in range(1, pages + 1):
+                buf = io.BytesIO()
+                frame.save(buf, "JPEG", quality=90)
+                Path(template.replace("%05d", f"{number:05d}")).write_bytes(buf.getvalue())
+
+        class _Result:
+            returncode = 0
+            ok = True
+
+        return _Result()
+
+    monkeypatch.setattr(pdf_module, "run_sandboxed", fake_run)
+    return calls
+
+
+def test_strict_carries_no_object_from_the_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Главное свойство профиля: выход собран из пикселей, а не из документа.
+
+    `-sDEVICE=pdfwrite` разбирал исходник и писал новый PDF, перенося текст и
+    аннотации вместе с действиями. Гарантия при этом держалась на чужом
+    распознавателе: `/Launch` её пережил, и сквозной стенд поймал это тем, что
+    `verify()` отверг собственный выход.
+    """
+    _fake_ghostscript(monkeypatch, pages=3)
+    src = _pdf_with_openaction(tmp_path / "in.pdf")
+
+    outcome = PdfSanitizer().sanitize(src, tmp_path, CdrProfile.STRICT)
+
+    assert PdfSanitizer().verify(outcome.path) == []
+    with pikepdf.open(outcome.path) as out:
+        assert len(out.pages) == 3
+        assert "/OpenAction" not in out.Root
+        for page in out.pages:
+            names = set(page.Resources.XObject.keys())
+            assert names == {"/Im0"}, f"на странице не только растр: {names}"
+
+
+def test_strict_embeds_the_raster_as_is(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Байты JPEG уезжают в поток как есть.
+
+    Разжатие страницы ради перекладывания в PDF стоило бы гигабайтов памяти на
+    многостраничном документе — OOM внутри собственного санитайзера.
+    """
+    _fake_ghostscript(monkeypatch, pages=1)
+    src = _pdf_with_openaction(tmp_path / "in.pdf")
+
+    outcome = PdfSanitizer().sanitize(src, tmp_path, CdrProfile.STRICT)
+
+    with pikepdf.open(outcome.path) as out:
+        image = out.pages[0].Resources.XObject["/Im0"]
+        assert image.Filter == pikepdf.Name.DCTDecode
+        assert image.read_raw_bytes().startswith(b"\xff\xd8")
+
+
+def test_strict_fails_loudly_when_nothing_was_drawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ноль нарисованных страниц — отказ, а не пустой «обезвреженный» файл.
+
+    Пустой PDF выглядел бы успехом: вердикт мягчал бы, а клиент получал бы
+    документ без содержимого под видом проверенного.
+    """
+    from worker_app.cdr.base import SanitizeError
+
+    _fake_ghostscript(monkeypatch, pages=0)
+    src = _pdf_with_openaction(tmp_path / "in.pdf")
+
+    with pytest.raises(SanitizeError):
+        PdfSanitizer().sanitize(src, tmp_path, CdrProfile.STRICT)
