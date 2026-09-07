@@ -224,9 +224,15 @@ services:
       IMAGE_TAG: ${IMAGE_TAG:-latest}
       PYTHONPATH: /app
       KEYS_FILE: /app/config/keys.json
+      # Учётные данные приёмников обезвреженных копий (M14.8). Отдельный
+      # каталог, а не файл в `config`: тот монтируется и воркеру, а ключ от
+      # чужого хранилища процессу, разбирающему враждебные файлы, знать
+      # нельзя. Здесь секреты допустимы — этот сервис контент не разбирает.
+      DELIVERY_CREDENTIALS_FILE: /app/secrets/delivery.json
       METRICS_PORT: "9103"
     volumes:
       - ./config:/app/config:ro
+      - ./secrets:/app/secrets:ro
     depends_on:
       redis: {condition: service_healthy}
     restart: unless-stopped

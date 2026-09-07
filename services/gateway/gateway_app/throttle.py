@@ -19,6 +19,7 @@ from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 
 from vscommon.keys import KEY_ID_HEADER
+from vscommon.metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,7 @@ async def throttle_middleware(request: Request, call_next):
             "частота запросов превышена",
             extra={"ведро": bucket, "observed": int(decision.observed)},
         )
+        metrics().rejections.labels(reason="rate_limit").inc()
         return _too_many(decision.retry_after_s)
 
     return await call_next(request)

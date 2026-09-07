@@ -60,6 +60,12 @@ class WorkerSettings(CommonSettings):
     правил. Уменьшать имеет смысл вместе с канареечной выкаткой (M7.2).
     """
 
+    delivery_stream: str = "scan.delivery"
+    delivery_group: str = "deliverers"
+    """Выгрузка обезвреженных копий (M14). Отдельно от коллбэков: доставка
+    файла в чужое хранилище может тянуться минутами, и в общей очереди она
+    задерживала бы уведомления остальным тенантам."""
+
     callback_timeout_s: float = 5.0
     callback_retries: int = 3
 

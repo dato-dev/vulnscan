@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import time
 from collections import deque
 
 from vscommon.allowlist import Allowlist, audit_line
@@ -15,7 +16,13 @@ from vscommon.freshness import HOUR, Freshness, age_of, parse_clamav_built_at
 from vscommon.hashing import short
 from vscommon.journal import AttemptJournal
 from vscommon.logging import log_context, setup_logging
-from vscommon.metrics import metrics, setup_metrics, tenant_label
+from vscommon.metrics import (
+    CACHED_NONE,
+    CACHED_STRUCTURAL,
+    metrics,
+    setup_metrics,
+    tenant_label,
+)
 from vscommon.metrics import serve as serve_metrics
 from vscommon.models import (
     REQUEST_DERIVED_CODES,
@@ -25,6 +32,7 @@ from vscommon.models import (
     CallbackTask,
     DeadLetter,
     DeadLetterReason,
+    DeliveryTask,
     Finding,
     ScanFacts,
     ScanJob,
@@ -38,6 +46,7 @@ from vscommon.models import (
 from vscommon.queue import (
     CallbackQueue,
     DeadLetterQueue,
+    DeliveryQueue,
     Heartbeat,
     JobQueue,
     ResultChannel,
@@ -56,13 +65,17 @@ from vscommon.telemetry import (
 )
 
 from .config import settings
-from .deep import deep_job, deep_reason
+from .deep import deep_job, deep_reason, reason_code
 from .failure import crashed_on_content, should_retry
 from .pipeline import Pipeline
 from .reclaim import StuckJobReclaimer
 from .scoring import verdict_on_failure
 
 logger = logging.getLogger(__name__)
+
+_VERDICT_RANK = {Verdict.CLEAN: 0, Verdict.SUSPICIOUS: 1, Verdict.MALICIOUS: 2}
+"""Порядок строгости вердиктов. `unsupported`, `encrypted` и `error` в него не
+входят намеренно: это не «мягче» и не «строже», а «не проверено»."""
 
 CANARY_BUFFER = 5_000
 """Сколько расхождений канарейки держать до сброса в Redis.
@@ -115,6 +128,12 @@ class Worker:
         # ключи в процессе, разбирающем враждебные файлы, нельзя.
         self._callbacks = CallbackQueue(
             self._redis, settings.callbacks_stream, settings.callbacks_group
+        )
+        # Отдельная очередь от коллбэков: выгрузка файла может упираться в
+        # чужое хранилище минутами, коллбэк — это один HTTP-запрос. В общей
+        # очереди недоступный приёмник задерживал бы уведомления всем.
+        self._deliveries = DeliveryQueue(
+            self._redis, settings.delivery_stream, settings.delivery_group
         )
         self._semaphore = asyncio.Semaphore(settings.concurrency)
         self._tasks: set[asyncio.Task[None]] = set()
@@ -184,6 +203,17 @@ class Worker:
 
             await self._observe_queues()
 
+            # Подхват — это всегда чужая авария: воркер умер, не доработав
+            # задачу. В логе она видна одной строкой `WARNING`, то есть
+            # замечает её только тот, кто в этот момент читает логи. Всплеск
+            # подхватов — самый ранний признак цикла «падаем на файле, задача
+            # уходит следующему»; `vs_dlq_size` покажет это позже и только
+            # после того, как лимит доставок исчерпан.
+            if sweep.reclaimed:
+                metrics().reclaimed_jobs.labels(outcome="reclaimed").inc(len(sweep.reclaimed))
+            if sweep.abandoned:
+                metrics().reclaimed_jobs.labels(outcome="abandoned").inc(len(sweep.abandoned))
+
             for claimed in sweep.reclaimed:
                 await self._spawn(claimed.entry_id, claimed.job)
             for claimed in sweep.abandoned:
@@ -204,6 +234,7 @@ class Worker:
             return
 
         await self._deep_queue.publish(deep_job(job, reason))
+        metrics().deep_scans.labels(reason=reason_code(reason)).inc()
         logger.info("файл отправлен на углублённую проверку", extra={"reason": reason})
 
     async def _check_allowlist(self, sha256: str, tenant: str | None, verdict: Verdict) -> bool:
@@ -328,6 +359,49 @@ class Worker:
             # Очередь недоступна — вердикт всё равно посчитан и сохранён.
             logger.exception("не удалось поставить коллбэк в очередь доставки")
 
+    async def _enqueue_delivery(self, job: ScanJob, result: ScanResult) -> None:
+        """Ставит выгрузку копии в хранилище клиента (M14.1).
+
+        Задание ставится и тогда, когда выгружать нечего: файл не прошёл
+        проверку, но решение о нём обязано появиться в приёмнике манифестом.
+        «Файла нет» иначе означает одновременно «заблокирован», «ещё в работе»
+        и «сервис сломался», и различить их по содержимому ящика невозможно.
+
+        Приёмник кладётся в задание целиком: решение принято политикой,
+        действовавшей на момент проверки, и правка политики не должна
+        переносить файл, который уже в пути.
+        """
+        policy = job.policy
+        if policy.delivery_error:
+            # Приёмник описан негодно. Молчать нельзя: тенанту его настроили,
+            # значит файлы ждут, а они не придут.
+            logger.error(
+                "приёмник тенанта негоден, копия не выгружена",
+                extra={"причина": policy.delivery_error},
+            )
+            return
+        if policy.delivery is None:
+            return
+
+        try:
+            await self._deliveries.publish(
+                DeliveryTask(
+                    scan_id=result.scan_id,
+                    tenant=job.tenant,
+                    destination=policy.delivery,
+                    artifact=result.sanitized.ref if result.sanitized else None,
+                    # Исходное имя файла не используется: оно часто содержит
+                    # персональные данные, и мы его не храним. Сопоставить
+                    # объект с обращением клиент может по `scan_id` из манифеста.
+                    name=f"{result.scan_id}{job.filename_ext}",
+                    payload=result.model_dump_json(),
+                    traceparent=current_traceparent() or "",
+                )
+            )
+        except Exception:
+            # Очередь недоступна — вердикт всё равно посчитан и сохранён.
+            logger.exception("не удалось поставить выгрузку копии в очередь")
+
     async def _record_history(self, job: ScanJob, result: ScanResult) -> None:
         """Отправляет запись в поток истории.
 
@@ -344,6 +418,7 @@ class Worker:
                     detected_mime=result.facts.detected_mime if result.facts else None,
                     rules_version=self._pipeline.rules_version,
                     av_db_version=self._pipeline.engine_version,
+                    traceparent=current_traceparent() or "",
                 )
             )
         except Exception:
@@ -393,6 +468,7 @@ class Worker:
                     await self._results.publish(completed)
                     if job.callback_url:
                         await self._enqueue_callback(job, completed)
+                        await self._enqueue_delivery(job, completed)
                     await self._queue.ack(entry_id)
                     return
 
@@ -524,6 +600,37 @@ class Worker:
             findings=[Finding(stage="worker", code=code, severity=Severity.MEDIUM, detail=detail)],
         )
 
+    @staticmethod
+    def _observe_verdict(job: ScanJob, result: ScanResult) -> None:
+        """Завершённый скан — здесь, а не в gateway.
+
+        Gateway видит вердикт только тогда, когда тот успел в `wait_ms`. Всё,
+        что не успело, уходит клиенту коллбэком, и в gateway такой скан
+        существует лишь как `202` без вердикта. Пока счёт вёлся там,
+        `vs_scans_total` описывал не поток, а полосу между кэшем и дедлайном:
+        тяжёлые файлы уходят в `202` чаще лёгких, а вердикт у них чаще не
+        `clean`. На этом счётчике стоит алерт на долю вредоносных — он делил
+        одно смещённое число на другое.
+
+        Углублённая проверка сюда не попадает: клиент получил один ответ на
+        файл, и второй вердикт не должен удваивать поток. Для неё нужна своя
+        метрика — иначе расхождение быстрой и углублённой проверок, ради
+        которого она и заведена, нигде не видно.
+
+        Время меряется от постановки в очередь, а не от начала конвейера:
+        ожидание в очереди клиент ждёт наравне с разбором.
+        """
+        current = metrics()
+        current.scans.labels(
+            verdict=result.verdict.value,
+            tenant=tenant_label(job.tenant),
+            mode=job.mode.value,
+        ).inc()
+        current.verdict_seconds.labels(
+            profile=job.profile.value,
+            cached=CACHED_STRUCTURAL if job.cached is not None else CACHED_NONE,
+        ).observe(max(0.0, time.time() - job.enqueued_at))
+
     async def _deliver(
         self, job: ScanJob, result: ScanResult, status_ttl_s: int | None = None
     ) -> None:
@@ -536,6 +643,8 @@ class Worker:
             # действовал по нему. Углублённый приходит отдельным коллбэком.
             await self._deliver_deep(job, result)
             return
+
+        self._observe_verdict(job, result)
 
         # Порядок важен: сначала разбудить gateway, потом кэш и вебхук.
         if status_ttl_s is None:
@@ -563,6 +672,13 @@ class Worker:
                 codes=[f.code for f in result.findings if f.score > 0],
                 sha256=result.sha256,
             )
+            # То же число, но на графике рядом с вердиктами. В Redis его видит
+            # только тот, кто спросит через админский API, — а решение включать
+            # блокировки принимают, глядя на то, как доля вела себя неделю.
+            metrics().shadow_records.labels(
+                tenant=tenant_label(job.policy.tenant),
+                would_block=str(refused).lower(),
+            ).inc()
             if refused:
                 logger.warning(
                     "теневой режим: пользователю отказали бы",
@@ -575,6 +691,7 @@ class Worker:
 
         if job.callback_url:
             await self._enqueue_callback(job, result)
+            await self._enqueue_delivery(job, result)
 
     async def _store_cache(self, job: ScanJob, result: ScanResult) -> None:
         """Раскладывает результат по двум уровням.
@@ -620,7 +737,62 @@ class Worker:
             )
         )
 
+    @staticmethod
+    def _verdict_change(fast: ScanResult | None, deep: ScanResult) -> str:
+        """Чем углублённая проверка разошлась с быстрой.
+
+        `stricter` — быстрая пропустила: это цена бюджета в сотни миллисекунд,
+        и ради её измерения выборка чистых и берётся. `looser` — быстрая
+        сработала ложно. `resolved` — быстрая не смогла разобрать файл, а
+        углублённая довела его до вердикта.
+
+        `unknown` — не с чем сравнивать: статус быстрой проверки живёт по TTL и
+        мог истечь. Это отдельное значение, а не «совпало»: молча посчитать
+        несравнимое совпадением значит занизить долю пропусков, то есть ровно
+        то число, ради которого всё считается.
+        """
+        if fast is None:
+            return "unknown"
+        if fast.verdict is deep.verdict:
+            return "agree"
+
+        before = _VERDICT_RANK.get(fast.verdict)
+        after = _VERDICT_RANK.get(deep.verdict)
+        if before is None:
+            return "resolved" if after is not None else "unknown"
+        if after is None:
+            return "unknown"
+        return "stricter" if after > before else "looser"
+
+    async def _observe_deep_change(self, job: ScanJob, result: ScanResult) -> None:
+        """Сравнение двух вердиктов — единственное, ради чего есть выборка чистых.
+
+        Читает статус родителя из Redis: лишний вызов, но углублённая проверка
+        и так вне горячего пути, а без сравнения дорогая работа не отвечает ни
+        на один вопрос.
+        """
+        fast = await self._results.load_status(job.parent_scan_id) if job.parent_scan_id else None
+        change = self._verdict_change(fast, result)
+        metrics().deep_changes.labels(change=change).inc()
+        if change in ("stricter", "looser"):
+            logger.warning(
+                "углублённая проверка разошлась с быстрой",
+                extra={
+                    "change": change,
+                    "быстрая": fast.verdict.value if fast else "?",
+                    "углублённая": result.verdict.value,
+                    "reason": job.deep_reason,
+                },
+            )
+
     async def _deliver_deep(self, job: ScanJob, result: ScanResult) -> None:
+        try:
+            await self._observe_deep_change(job, result)
+        except Exception:
+            # Наблюдение не имеет права стоить вердикта: недоступный Redis
+            # здесь означает потерю одного измерения, а не потерю результата.
+            logger.warning("не удалось сравнить вердикты быстрой и углублённой проверок")
+
         logger.info(
             "углублённая проверка завершена",
             extra={
@@ -633,6 +805,7 @@ class Worker:
         await self._results.store_status(result, ttl_s=settings.dlq_status_ttl_s)
         if job.callback_url:
             await self._enqueue_callback(job, result)
+            await self._enqueue_delivery(job, result)
         await self._concurrency.release(job.tenant or "default", job.scan_id)
 
     async def _publish_engine_version(self) -> None:
@@ -646,6 +819,10 @@ class Worker:
         # Определение типа по таблице сигнатур вместо libmagic — это работающий
         # сервис с худшим детектом. В логах об этом одна строка при старте.
         metrics().report_degraded("libmagic", not self._pipeline.libmagic_available)
+        # Веса рядом и по той же причине: файл задан и не прочитан — балл
+        # считается по встроенной таблице, то есть по чужим порогам, и наружу
+        # это выглядит как обычная работа.
+        metrics().report_degraded("weights", self._pipeline.weights_degraded)
 
         # Момент сборки базы, а не только её версия: по версии не понять,
         # остановилось ли обновление. Публикуем разобранное значение, чтобы

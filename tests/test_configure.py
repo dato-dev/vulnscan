@@ -219,6 +219,17 @@ def test_check_on_empty_directory_is_not_an_error(tool: Any, files: Any) -> None
 # --- вопросы не должны отставать от модели --------------------------------
 
 
+COMPUTED = {
+    "tenant": "подставляется по имени записи в файле",
+    "delivery_error": (
+        "выставляет загрузчик, когда блок delivery описан негодно. Человеку "
+        "этого поля задавать нечего: он задаёт сам delivery, а ошибку разбора "
+        "сервис обнаруживает сам"
+    ),
+}
+"""Поля политики, которые не спрашивают: их вычисляет сервис, а не оператор."""
+
+
 def test_policy_questions_cover_the_model(tool: Any) -> None:
     """Поле, добавленное в TenantPolicy, обязано появиться в вопросах.
 
@@ -226,8 +237,22 @@ def test_policy_questions_cover_the_model(tool: Any) -> None:
     ошибки, ни предупреждения, просто в файле никогда не появится ключ.
     """
     asked = {param.name for param in tool.POLICY_PARAMS}
-    model = set(TenantPolicy.model_fields) - {"tenant"}
+    model = set(TenantPolicy.model_fields) - set(COMPUTED)
+
     assert asked == model, f"вопросы разошлись с моделью: {asked ^ model}"
+
+
+def test_computed_fields_are_really_computed() -> None:
+    """Список исключений не должен становиться местом, куда прячут забытое.
+
+    Проверяется, что исключённое поле и правда существует в модели: иначе
+    строка переживает своё поле и начинает молча покрывать чужое имя.
+    """
+    stale = set(COMPUTED) - set(TenantPolicy.model_fields)
+
+    assert not stale, f"в исключениях поля, которого нет в модели: {sorted(stale)}"
+    for name, reason in COMPUTED.items():
+        assert len(reason) > 20, f"{name}: причина исключения не написана"
 
 
 def test_policy_answers_are_accepted_by_the_model(tool: Any) -> None:
@@ -331,3 +356,65 @@ def _loaded_key(path: Path, key_id: str) -> Any:
     from vscommon.keys import KeyRegistry
 
     return KeyRegistry.load(str(path)).get(key_id)
+
+
+# --- разграничение приёмников (M14.4) --------------------------------------
+
+
+def _policies(tmp_path: Any, payload: dict) -> Any:
+    from pathlib import Path
+
+    path = Path(tmp_path) / "policies.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def test_destination_without_a_prefix_is_flagged(tool: Any, tmp_path: Any) -> None:
+    """Учётной записью без префикса можно писать в весь бакет.
+
+    Формально это годная конфигурация, поэтому загрузчик её принимает.
+    Практически префикс на тенанта — единственное, что ограничивает ущерб от
+    утечки этой учётки.
+    """
+    path = _policies(
+        tmp_path, {"team-a": {"delivery": {"bucket": "clean", "credentials_id": "drop"}}}
+    )
+
+    problems = tool.verify_policies(path)
+
+    assert any("prefix" in problem for problem in problems), problems
+
+
+def test_two_tenants_in_one_directory_are_flagged(tool: Any, tmp_path: Any) -> None:
+    """Документы двух клиентов не должны смешиваться в одном каталоге."""
+    same = {"bucket": "clean", "prefix": "vulnscan/", "credentials_id": "drop"}
+    path = _policies(tmp_path, {"team-a": {"delivery": same}, "team-b": {"delivery": same}})
+
+    problems = tool.verify_policies(path)
+
+    assert any("смешаются" in problem for problem in problems), problems
+
+
+def test_separate_prefixes_pass(tool: Any, tmp_path: Any) -> None:
+    """Проверка проверки: правильная конфигурация не должна ругаться."""
+    path = _policies(
+        tmp_path,
+        {
+            "team-a": {"delivery": {"bucket": "clean", "prefix": "a/", "credentials_id": "d1"}},
+            "team-b": {"delivery": {"bucket": "clean", "prefix": "b/", "credentials_id": "d2"}},
+        },
+    )
+
+    assert tool.verify_policies(path) == []
+
+
+def test_broken_destination_is_reported_by_the_checker(tool: Any, tmp_path: Any) -> None:
+    """Опечатку видно до выката, а не по отсутствию файлов в ящике."""
+    path = _policies(
+        tmp_path,
+        {"team-a": {"delivery": {"buckett": "clean", "credentials_id": "drop"}}},
+    )
+
+    problems = tool.verify_policies(path)
+
+    assert any("приёмник" in problem for problem in problems), problems

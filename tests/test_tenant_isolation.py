@@ -26,6 +26,7 @@ from fastapi import HTTPException
 from vscommon.allowlist import Allowlist, AllowlistEntry
 from vscommon.cache import AvCache, StructuralCache
 from vscommon.canary import CanaryLedger
+from vscommon.delivery import Delivery
 from vscommon.idempotency import ScanRegistry
 from vscommon.journal import AttemptJournal
 from vscommon.keys import AccessKey
@@ -36,6 +37,7 @@ from vscommon.models import (
     CdrProfile,
     DeadLetter,
     DeadLetterReason,
+    DeliveryTask,
     ObjectRef,
     ScanFacts,
     ScanResult,
@@ -47,6 +49,7 @@ from vscommon.provisioning import TenantStore
 from vscommon.queue import (
     CallbackQueue,
     DeadLetterQueue,
+    DeliveryQueue,
     Heartbeat,
     JobQueue,
     ResultChannel,
@@ -107,7 +110,11 @@ SHARED = {
     "engine": "версии движков — свойство установки, не клиента",
     "callbacks": "внутренняя очередь повторов, наружу не отдаётся",
     "scan.jobs": "поток задач: воркеры разбирают его целиком",
-    "scan.dlq": "поток разбора; отбор по тенанту делает ручка, не ключ",
+    "scan.dlq": "поток разбора; отбор по тенанту делает ключ ручки, не ключ Redis",
+    "scan.delivery": (
+        "поток выгрузки копий: notifier разбирает его целиком, приёмник и "
+        "тенант лежат внутри задания"
+    ),
     "results": "поток результатов для писателя истории",
     "inflight": "heartbeat записи потока, живёт по entry_id",
     "canary": (
@@ -198,6 +205,15 @@ async def _write_everything(redis, tenant: str) -> None:
     )
     await JobQueue(redis, stream="scan.jobs", group="workers").ensure_group()
     await ResultStream(redis, stream="results", group="writer").publish(result)
+    await DeliveryQueue(redis, stream="scan.delivery", group="deliverers").publish(
+        DeliveryTask(
+            scan_id=SCAN_ID,
+            tenant=tenant,
+            destination=Delivery(bucket="b", credentials_id="c"),
+            name="doc.pdf",
+            payload=result.model_dump_json(),
+        )
+    )
     await CallbackQueue(redis, stream="callbacks", group="notifier").publish(
         CallbackTask(
             scan_id=SCAN_ID,

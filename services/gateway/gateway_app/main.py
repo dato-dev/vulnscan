@@ -17,7 +17,7 @@ from vscommon.telemetry import setup_tracing, shutdown_tracing
 
 from .config import settings
 from .cors import cors_middleware
-from .observability import metrics_middleware
+from .observability import metrics_middleware, tracing_middleware
 from .routes import admin, health, ops, scan, widget
 from .state import build_state
 from .throttle import throttle_middleware
@@ -72,7 +72,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 # Порядок важен: метрики снаружи, чтобы в них попали и отвергнутые запросы.
+# Трассировка между ними — отвергнутый запрос должен быть виден и в трейсе, но
+# спан не должен переживать снятие метрики.
 app.middleware("http")(throttle_middleware)
+app.middleware("http")(tracing_middleware)
 app.middleware("http")(metrics_middleware)
 # Регистрируется последним — значит выполняется первым. Так и нужно: preflight
 # не должен расходовать лимит частоты и попадать в метрики как обращение

@@ -82,6 +82,9 @@ class _NoopSpan:
     def set_attribute(self, key: str, value: object) -> None:
         return None
 
+    def update_name(self, name: str) -> None:
+        return None
+
     def record_exception(self, exc: BaseException) -> None:
         return None
 

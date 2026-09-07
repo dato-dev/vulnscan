@@ -207,6 +207,17 @@ class Pipeline:
         """Деградация до таблицы сигнатур должна быть видна в /readyz."""
         return any(getattr(stage, "libmagic_available", False) for stage in self._stages)
 
+    @property
+    def weights_degraded(self) -> bool:
+        """Файл весов задан и не прочитан — балл считается по встроенным.
+
+        Молчаливее этого мало что бывает: стадии отрабатывают, признаки
+        находятся, вердикт выдаётся — просто по чужим порогам. Ни в логах после
+        старта, ни в вердиктах это не видно, а `unknown_codes` тут не помогут:
+        встроенная таблица знает все коды, она просто оценивает их иначе.
+        """
+        return self._weights.degraded
+
     async def process(
         self,
         job: ScanJob,

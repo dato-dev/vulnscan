@@ -5,11 +5,16 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO, Protocol
 
 from vscommon.config import CommonSettings
+from vscommon.metrics import metrics
 from vscommon.models import ObjectRef
+from vscommon.telemetry import span
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +25,34 @@ def _stream_size(fileobj: BinaryIO) -> int:
     size = fileobj.tell()
     fileobj.seek(0)
     return size
+
+
+@contextmanager
+def _measured(op: str) -> Iterator[None]:
+    """Время обращения к хранилищу — в метрику и в спан.
+
+    До этого обращения к S3 были единственным сетевым вызовом в горячем пути,
+    не видным ни там, ни там: медленное или отвечающее с перебоями хранилище
+    проявлялось размазанным ростом времени до вердикта, без указания на
+    причину. Спан здесь важен не меньше метрики — он показывает вызов **внутри**
+    стадии, а не поверх неё.
+
+    В метку не идут ни бакет, ни ключ: ключ содержит sha256, то есть ряд на
+    каждый файл. Что именно не читается, видно по `scan_id` в логе.
+
+    Вызывается и из потоков (`asyncio.to_thread`), поэтому обёртка синхронная:
+    контекст трассировки `to_thread` переносит сам, копируя `contextvars`.
+    """
+    started = time.perf_counter()
+    ok = "true"
+    try:
+        with span(f"storage.{op}", op=op):
+            yield
+    except Exception:
+        ok = "false"
+        raise
+    finally:
+        metrics().storage_seconds.labels(op=op, ok=ok).observe(time.perf_counter() - started)
 
 
 class ObjectStore(Protocol):
@@ -101,17 +134,22 @@ class S3Store:
         # Размер снимается ДО заливки: boto3 дочитывает поток и закрывает его,
         # поэтому tell() после upload_fileobj падает на закрытом файле.
         size = _stream_size(fileobj)
-        self._client.upload_fileobj(fileobj, bucket, key, ExtraArgs={"ContentType": content_type})
+        with _measured("put"):
+            self._client.upload_fileobj(
+                fileobj, bucket, key, ExtraArgs={"ContentType": content_type}
+            )
         return ObjectRef(backend="s3", bucket=bucket, key=key, size=size, content_type=content_type)
 
     def get_to_path(self, ref: ObjectRef, dest: Path) -> Path:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        self._client.download_file(ref.bucket, ref.key, str(dest))
+        with _measured("get"):
+            self._client.download_file(ref.bucket, ref.key, str(dest))
         return dest
 
     def exists(self, ref: ObjectRef) -> bool:
         try:
-            self._client.head_object(Bucket=ref.bucket, Key=ref.key)
+            with _measured("exists"):
+                self._client.head_object(Bucket=ref.bucket, Key=ref.key)
         except Exception:
             return False
         return True

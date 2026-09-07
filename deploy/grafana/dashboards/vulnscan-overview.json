@@ -336,7 +336,7 @@
     {
       "type": "timeseries",
       "title": "Ответы из кэша против полного прохода",
-      "description": "Доля кэша объясняет провалы и всплески времени лучше всего остального.",
+      "description": "Доля кэша объясняет провалы и всплески времени лучше всего остального.\n\nТри уровня, а не два: `full` — вердикт собран из кэша целиком, отвечает gateway; `structural` — разбор переиспользован, антивирус прогнан заново; `none` — полный проход. Раньше значений было два, и `true` означало `structural`, а полный кэш-хит в метрику не попадал вовсе.",
       "datasource": {
         "type": "prometheus",
         "uid": "${DS_PROMETHEUS}"
@@ -353,8 +353,8 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(vs_verdict_duration_seconds_count{cached=\"true\"}[5m]))",
-          "legendFormat": "из кэша",
+          "expr": "sum(rate(vs_verdict_duration_seconds_count{cached=\"full\"}[5m]))",
+          "legendFormat": "целиком из кэша",
           "refId": "A"
         },
         {
@@ -362,9 +362,18 @@
             "type": "prometheus",
             "uid": "${DS_PROMETHEUS}"
           },
-          "expr": "sum(rate(vs_verdict_duration_seconds_count{cached=\"false\"}[5m]))",
-          "legendFormat": "полный проход",
+          "expr": "sum(rate(vs_verdict_duration_seconds_count{cached=\"structural\"}[5m]))",
+          "legendFormat": "разбор из кэша, антивирус заново",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum(rate(vs_verdict_duration_seconds_count{cached=\"none\"}[5m]))",
+          "legendFormat": "полный проход",
+          "refId": "C"
         }
       ],
       "fieldConfig": {
@@ -604,6 +613,90 @@
         "defaults": {
           "unit": "reqps",
           "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Отказы на входе по причинам",
+      "description": "Что именно мы ответили клиенту вместо проверки.\n\nВ vs_http_requests_total все эти отказы — один и тот же 429, а действия у них разные: `rate_limit` — поднять предел частоты тенанту; `concurrency` — поднять предел одновременных проверок или добавить воркеров; `quota` — суточная квота публичного ключа исчерпана, это разговор с клиентом, а не с инфраструктурой; `ticket_rate` — частота выдачи талонов виджету; `too_large` — файл больше предела политики (413, а не 429).\n\nНоль — норма. Ровный ненулевой rate_limit означает, что предел тенанта занижен, а не что его атакуют.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (reason) (rate(vs_rejections_total[5m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "Пусто — никого не отвергали. Это норма, а не потеря метрики."
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Теневой режим: заблокировали бы",
+      "description": "Доля файлов, которым отказали бы, если бы тенант включил блокировки (M7.5).\n\nСчитаются ОТКАЗЫ, а не только вердикт malicious: файл, который не удалось пересобрать, пользователю тоже не отдадут.\n\nЭто то число, по которому принимают решение включать блокировки, — и смотреть на него надо не в моменте, а неделю. До M10.17 оно жило только в Redis и было видно лишь тому, кто спросит через админский API.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 33,
+        "w": 12,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "expr": "sum by (tenant) (rate(vs_shadow_records_total{would_block=\"true\"}[1h])) / clamp_min(sum by (tenant) (rate(vs_shadow_records_total[1h])), 0.001)",
+          "legendFormat": "{{tenant}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "noValue": "Пусто — теневой режим никому не включён (TenantPolicy.shadow_mode). Обычное состояние."
         },
         "overrides": []
       },

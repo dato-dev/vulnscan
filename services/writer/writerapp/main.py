@@ -17,12 +17,12 @@ import signal
 import time
 
 from vscommon.logging import setup_logging
-from vscommon.metrics import metrics, setup_metrics
+from vscommon.metrics import metrics, setup_metrics, tenant_label
 from vscommon.metrics import serve as serve_metrics
 from vscommon.models import ScanRecord
 from vscommon.queue import ResultStream
 from vscommon.redis_client import create_redis
-from vscommon.telemetry import setup_tracing, shutdown_tracing
+from vscommon.telemetry import continue_trace, setup_tracing, shutdown_tracing, span
 
 from .config import settings
 from .db import Database
@@ -103,13 +103,14 @@ class Writer:
         """
         records = [record for _entry_id, record in batch]
         try:
-            written = await self._db.store(records)
+            with span("history.flush", records=len(records)):
+                written = await self._db.store(records)
         except Exception:
             # Записи не подтверждены в потоке, поэтому не потеряны: вернём их
             # в пачку и попробуем снова. Без возврата они ушли бы из памяти,
             # а из потока — только по истечении срока хранения.
             logger.exception("не удалось записать историю, повторим")
-            metrics().stage_failures.labels(stage="writer", reason="db").inc()
+            metrics().history_writes.labels(outcome="failed").inc()
             async with self._lock:
                 self._batch = batch + self._batch
             return
@@ -117,6 +118,9 @@ class Writer:
         for entry_id, _record in batch:
             await self._stream.ack(entry_id)
         logger.info("история записана", extra={"записей": written})
+        # Успех считается тоже: счётчик, растущий только при поломке, не
+        # отличить от неработающего экспорта — и от остановившегося writer.
+        metrics().history_writes.labels(outcome="applied").inc()
 
         # Отставание меряется здесь, а не на приёме: до записи в базу история
         # существует только в памяти процесса. Именно так она однажды и жила —
@@ -124,14 +128,38 @@ class Writer:
         # и выглядело это как работающий сервис.
         now = time.time()
         for _entry_id, record in batch:
-            metrics().history_lag.observe(max(0.0, now - record.result.created_at))
+            lag_s = max(0.0, now - record.result.created_at)
+            metrics().history_lag.observe(lag_s)
+            # По спану на запись — в трейсе её собственного скана. Пачка общая,
+            # а трейсы у записей разные, поэтому одним спаном вокруг сброса тут
+            # не обойтись: он ответил бы «пачка доехала», а спрашивают всегда
+            # про конкретный файл. Без этого writer был тупиком — трассировка
+            # настроена, спанов ноль, и трейс обрывался на публикации в поток.
+            with continue_trace(
+                record.traceparent,
+                "history.write",
+                lag_s=round(lag_s, 3),
+                tenant=tenant_label(record.tenant),
+            ):
+                pass
 
     async def _prune_loop(self) -> None:
+        """Чистка по сроку хранения.
+
+        Неработающая чистка ничем себя не проявляет: сервис отвечает, история
+        пишется, а срок хранения тихо перестаёт соблюдаться — и обнаруживается
+        это по месту на диске либо по вопросу о персональных данных, которые
+        полагалось удалить. Поэтому исход прохода считается всегда, включая
+        успешный: счётчик, растущий только при поломке, не отличить от
+        остановившегося цикла.
+        """
         while not self._stopping.is_set():
             try:
                 await self._db.prune(settings.history_retention_days)
+                metrics().retention_runs.labels(outcome="applied").inc()
             except Exception:
                 logger.exception("не удалось подчистить историю")
+                metrics().retention_runs.labels(outcome="failed").inc()
             await asyncio.sleep(PRUNE_INTERVAL_S)
 
     async def stop(self) -> None:

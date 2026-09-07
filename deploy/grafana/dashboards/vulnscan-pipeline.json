@@ -615,6 +615,54 @@
     },
     {
       "type": "timeseries",
+      "title": "Запись истории в базу",
+      "description": "Сбросы пачки в PostgreSQL. Рядом с отставанием: отставание говорит, насколько история отстаёт, эта панель — доходит ли она вообще.\n\n`applied` — пульс writer. Ровная линия, упавшая в ноль при непустой очереди, означает остановившийся сброс.\n`failed` — база недоступна. Записи при этом не подтверждены в потоке и не потеряны, но копятся в памяти процесса.\n\nРаньше отказ записи считался как `vs_stage_failures_total{stage=\"writer\"}` — чужой меткой, из-за которой алерт «Стадии массово падают» показывал недоступную базу как падающую стадию конвейера.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vs_history_writes_total{outcome=\"applied\"}[5m]))",
+          "legendFormat": "записано"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(vs_history_writes_total{outcome=\"failed\"}[5m]))",
+          "legendFormat": "отказ базы"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
       "title": "Канареечный набор правил",
       "description": "Набор-кандидат прогоняется вхолостую рядом с действующим (M7.2): на вердикт он не влияет, поэтому по вердиктам его не видно вовсе — только здесь.\n\n`candidate_only` — файлы, которые кандидат пометил бы, а действующий набор нет: это будущие ложные срабатывания, и решение о выкатке принимается по ним.\n`active_only` — детект, который выкатка потеряет.\n\nПусто — обычное состояние: канарейки нет, YARA_CANDIDATE_DIR не задан. Пустота во время выкатки означает, что кандидат не скомпилировался — смотрите vs_config_reloads_total{kind=\"yara_candidate\"}.",
       "datasource": {
@@ -637,6 +685,278 @@
       "fieldConfig": {
         "defaults": {
           "noValue": "Канарейки нет — обычное состояние. Во время выкатки пустота значит, что кандидат не скомпилировался.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Выгрузка копий клиентам",
+      "description": "Обезвреженная копия уезжает в хранилище клиента (M14). Без этой панели недоступный приёмник неотличим от «файлов на проверку нет»: и там, и там ящик пуст, а смотрит в него клиент, а не мы.\n\n`delivered` — уехал файл и манифест. `manifest_only` — файл не прошёл проверку, уехало только решение о нём; рост здесь означает выросшую блокировку, а не поломку доставки.\n`retry` — приёмник не ответил, повтор отложен. `lost` — не доехало совсем: смотрите GET /v1/ops/dlq, причина delivery_failed.\n\nПусто — обычное состояние: приёмники никому не настроены. Если настроены, а панель пуста, проверьте vs_degraded{component=\"delivery\"}: файл учётных данных мог не прочитаться.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(vs_deliveries_total[5m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Приёмники не настроены — обычное состояние. Если настроены, смотрите vs_degraded.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Подхват зависших задач",
+      "description": "Задачи, взятые из pending-списка после смерти воркера (M1.2).\n\n`reclaimed` — подхвачена и обрабатывается заново. `abandoned` — исчерпала лимит доставок, уходит в dead-letter.\n\nНоль — норма. Всплеск означает, что воркеры падают, и это самый ранний признак цикла «падаем на файле — задача уходит следующему»: vs_dlq_size покажет то же самое позже и только после исчерпания лимита доставок.\n\nРаньше событие было видно одной строкой WARNING в логе, то есть только тому, кто в этот момент логи читает.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 62
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vs_jobs_reclaimed_total{outcome=\"reclaimed\"}[5m]))",
+          "legendFormat": "подхвачено"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(vs_jobs_reclaimed_total{outcome=\"abandoned\"}[5m]))",
+          "legendFormat": "брошено в dead-letter"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "Пусто — норма: задачи не зависали. Проверьте /targets, если пусто и после падения воркера.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Углублённая проверка: за чем отправляют",
+      "description": "Файлы, ушедшие во вторую, дорогую проверку (M3).\n\n`grey_zone` — быстрая не дала однозначного ответа. `unscannable` — не смогла разобрать файл. `sampled` — выборка чистых, взятая чтобы измерить пропуски.\n\nПусто при DEEP_ENABLED=false — обычное состояние. Непустой grey_zone при пустом sampled означает, что выборка выключена (DEEP_SAMPLE_RATE=0), то есть пропуски не измеряются.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 62
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(vs_deep_scans_total[15m]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "Пусто — углублённая проверка выключена (DEEP_ENABLED). Это рабочее состояние, а не потеря метрики.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Углублённая проверка: расхождение с быстрой",
+      "description": "Ради чего берётся выборка чистых.\n\n`stricter` — углублённая нашла то, что быстрая пропустила. Это цена бюджета в сотни миллисекунд, и именно это число отвечает на вопрос «сколько мы пропускаем».\n`looser` — быстрая сработала ложно.\n`resolved` — быстрая не смогла разобрать файл, углублённая довела до вердикта.\n`unknown` — сравнивать не с чем: статус быстрой проверки истёк по TTL.\n\nРост stricter означает, что быстрый профиль пора пересматривать. Само измерение до M10.17 не выходило наружу вовсе: файл проверялся дважды, а сравнение нигде не оседало.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (change) (rate(vs_deep_verdict_changes_total[30m]))",
+          "legendFormat": "{{change}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "Пусто — углублённая проверка выключена либо ещё ничего не завершила.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Обращения к хранилищу",
+      "description": "S3/MinIO: единственный сетевой вызов в горячем пути.\n\nБез этой панели медленное хранилище проявляется размазанным ростом времени до вердикта без указания на причину — конвейер выглядит медленным, хотя ждёт он сеть.\n\n`put` делает gateway на приёме, `get` — воркер перед разбором и notifier перед выгрузкой копии. Рост ok=false означает недоступное хранилище, а не битые файлы.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, op) (rate(vs_storage_duration_seconds_bucket[5m])))",
+          "legendFormat": "p95 {{op}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(vs_storage_duration_seconds_count{ok=\"false\"}[5m]))",
+          "legendFormat": "отказы"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus.",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Чистка истории по сроку хранения",
+      "description": "Проход удаления записей старше HISTORY_RETENTION_DAYS.\n\nНеработающая чистка не проявляется ничем: сервис отвечает, история пишется, а срок хранения тихо перестаёт соблюдаться. Обнаруживается это по месту на диске либо по вопросу о персональных данных, которые полагалось удалить.\n\n`applied` — пульс цикла. Ровная линия, упавшая в ноль, означает остановившуюся чистку.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 78
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(vs_retention_runs_total{outcome=\"applied\"}[1h]))",
+          "legendFormat": "проходов"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(vs_retention_runs_total{outcome=\"failed\"}[1h]))",
+          "legendFormat": "отказов"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "noValue": "Нет данных. Проверьте, что цель скрейпится: /targets в Prometheus.",
           "custom": {
             "drawStyle": "line",
             "lineWidth": 2,

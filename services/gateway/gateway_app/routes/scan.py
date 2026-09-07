@@ -29,6 +29,7 @@ from vscommon.cache import assemble, weights_key_for
 from vscommon.callbacks import CallbackRejectedError, validate_callback
 from vscommon.hashing import short
 from vscommon.keys import AccessKey
+from vscommon.metrics import metrics
 from vscommon.models import ScanRequest, ScanResult, Verdict
 from vscommon.policy import upload_limit_for
 
@@ -110,7 +111,6 @@ async def scan_upload(
         file,
         scan_request,
         idempotency_key,
-        request.headers.get("traceparent"),
         max_bytes=ticket.max_bytes if ticket is not None else None,
     )
     response.status_code = status.HTTP_200_OK if synchronous else status.HTTP_202_ACCEPTED
@@ -176,6 +176,7 @@ async def issue_ticket(request: Request, response: Response) -> dict[str, object
             f"public:{key.key_id}", policy.public_rate_limit_per_min
         )
         if not rate.allowed:
+            metrics().rejections.labels(reason="ticket_rate").inc()
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "превышена частота выдачи талонов",
@@ -190,6 +191,7 @@ async def issue_ticket(request: Request, response: Response) -> dict[str, object
                 "суточная квота публичного ключа исчерпана",
                 extra={"key_id": key.key_id, "лимит": policy.public_daily_tickets},
             )
+            metrics().rejections.labels(reason="quota").inc()
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "суточная квота исчерпана",
@@ -229,9 +231,7 @@ async def scan_by_ref(
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
-    result, synchronous = await Ingestor(_state(request)).ingest_ref(
-        scan_request, request.headers.get("traceparent")
-    )
+    result, synchronous = await Ingestor(_state(request)).ingest_ref(scan_request)
     response.status_code = status.HTTP_200_OK if synchronous else status.HTTP_202_ACCEPTED
     return result
 

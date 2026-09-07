@@ -21,6 +21,14 @@
     },
     "rate_limit_per_min": 120,
     "max_concurrent_scans": 8,
-    "max_upload_bytes": 20971520
+    "max_upload_bytes": 20971520,
+    "delivery": {
+      "backend": "s3",
+      "endpoint": "https://s3.legal.example",
+      "bucket": "incoming-clean",
+      "prefix": "vulnscan/team-legal/",
+      "region": "ru-central1",
+      "credentials_id": "team-legal-drop"
+    }
   }
 }

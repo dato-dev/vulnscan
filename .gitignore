@@ -22,6 +22,10 @@ build/
 !*.example
 !.env.example
 keys.json
+# Учётные данные приёмников обезвреженных копий (M14). Пример рядом —
+# `delivery.example.json` — в git попадает, значения нет.
+deploy/secrets/*.json
+!deploy/secrets/*.example.json
 proxy.env
 *secret*
 *.pem

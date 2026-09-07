@@ -31,6 +31,19 @@ from .config import settings
 logger = logging.getLogger(__name__)
 
 
+def _reload_counted(kind: str, *, failed: bool) -> None:
+    """Исход перезагрузки конфигурации на живом gateway.
+
+    Воркер считает так же (`kind="weights"`, `"yara"`), но там счёт идёт по
+    факту изменения: правила перечитываются, только если сменилась подпись
+    файла. Здесь ключи и политики перечитываются безусловно, раз в
+    `config_reload_interval_s`, поэтому единица счёта — попытка. Разница
+    полезная: ровный `applied` — это пульс цикла перезагрузки, и его
+    исчезновение видно раньше, чем устаревший ключ кого-нибудь пустит.
+    """
+    metrics().config_reloads.labels(kind=kind, outcome="failed" if failed else "applied").inc()
+
+
 @dataclass(slots=True)
 class AppState:
     redis: Redis
@@ -104,11 +117,20 @@ class AppState:
         from_file = KeyRegistry.load(settings.keys_file)
         try:
             self.keys = from_file.merged_with(await self.tenants.all_keys())
+            _reload_counted("keys", failed=False)
         except Exception:
             # Хранилище недоступно — работаем на файле. Он и заведён затем,
             # чтобы потеря Redis не отрезала доступ всем, включая админа.
             logger.exception("не удалось прочитать ключи из хранилища, беру только файл")
             self.keys = from_file
+            # Снаружи это неотличимо от исправной работы: сервис отвечает,
+            # ключи из файла действуют. Не действуют только заведённые через
+            # API — то есть отзыв ключа, сделанный через API, не применится, а
+            # мы будем считать, что применился.
+            _reload_counted("keys", failed=True)
+        # Файл ключей задан и не прочитан — реестр неполон. Отдельно от исхода
+        # перезагрузки: тот про попытку, этот про состояние.
+        metrics().report_degraded("keys", self.keys.degraded)
 
     async def reload_policies(self) -> None:
         """Подхватывает политики, заведённые через API."""
@@ -116,6 +138,7 @@ class AppState:
         # Файл политик задан, но не прочитан — работаем на встроенных. Пороги
         # при этом чужие, а вердикты продолжают выдаваться как ни в чём не бывало.
         metrics().report_degraded("policies", self.policies.degraded)
+        _reload_counted("policies", failed=self.policies.degraded)
 
     async def close(self) -> None:
         await self.redis.aclose()

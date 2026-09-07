@@ -13,7 +13,7 @@ from fastapi import HTTPException, status
 from vscommon.cache import assemble, weights_key_for
 from vscommon.hashing import StreamHasher, short
 from vscommon.logging import log_context
-from vscommon.metrics import metrics, tenant_label
+from vscommon.metrics import CACHED_FULL, metrics, tenant_label
 from vscommon.models import (
     CachedStructural,
     ObjectRef,
@@ -25,7 +25,7 @@ from vscommon.models import (
     Verdict,
 )
 from vscommon.policy import upload_limit_for
-from vscommon.telemetry import continue_trace, current_traceparent
+from vscommon.telemetry import current_traceparent, span
 
 from .cache_probe import CacheProbe
 from .config import settings
@@ -65,7 +65,6 @@ class Ingestor:
         upload,
         request: ScanRequest,
         idempotency_key: str | None = None,
-        traceparent: str | None = None,
         max_bytes: int | None = None,
     ) -> tuple[ScanResult, bool]:
         """Приём multipart-файла. Возвращает (результат, синхронный_ли_ответ).
@@ -73,7 +72,11 @@ class Ingestor:
         `max_bytes` приходит из талона (M12.1) и **сужает** предел политики, а
         не заменяет его. Иначе талон, выписанный когда-то на больший размер,
         пережил бы ужесточение политики и остался лазейкой.
+
+        Контекст трассировки сюда не передаётся: заголовок принимает
+        `tracing_middleware`, и всё внутри — обычные вложенные спаны.
         """
+        started = time.perf_counter()
         policy = self._state.policies.for_tenant(request.tenant)
         size_limit = upload_limit_for(policy)
         if max_bytes is not None:
@@ -81,16 +84,21 @@ class Ingestor:
 
         hasher = StreamHasher()
         with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as buffer:
-            while chunk := await upload.read(CHUNK):
-                hasher.update(chunk)
-                if hasher.size > size_limit:
-                    # Чтение прерываем сразу: дочитывать то, что всё равно
-                    # отвергнем, — подарок тому, кто шлёт большие файлы.
-                    raise HTTPException(
-                        status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                        f"файл больше {size_limit} байт",
-                    )
-                buffer.write(chunk)
+            # Чтение тела и потоковый sha256 — самая долгая часть приёма
+            # шестнадцатимегабайтного файла, и до этого спана она не попадала
+            # в трейс вовсе: `scan.accept` открывался уже после неё.
+            with span("ingest.read"):
+                while chunk := await upload.read(CHUNK):
+                    hasher.update(chunk)
+                    if hasher.size > size_limit:
+                        # Чтение прерываем сразу: дочитывать то, что всё равно
+                        # отвергнем, — подарок тому, кто шлёт большие файлы.
+                        metrics().rejections.labels(reason="too_large").inc()
+                        raise HTTPException(
+                            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            f"файл больше {size_limit} байт",
+                        )
+                    buffer.write(chunk)
 
             if hasher.size == 0:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "пустой файл")
@@ -98,8 +106,21 @@ class Ingestor:
             sha256 = hasher.hexdigest
             _check_idempotency_key(idempotency_key, sha256)
 
+            # Размер снимается на приёме, а не рядом с вердиктом. Рядом с
+            # вердиктом он описывал бы только те файлы, что успели ответить
+            # синхронно, — то есть заведомо лёгкие, при том что метрика
+            # заведена ровно ради тяжёлых.
+            self._observe_accepted(self._resolve_profile(request), hasher.size)
+
             probe = await self._lookup_cache(sha256, request, hasher.size)
             if probe.result is not None:
+                self._observe_verdict(
+                    probe.result,
+                    request,
+                    self._resolve_profile(request),
+                    CACHED_FULL,
+                    time.perf_counter() - started,
+                )
                 return probe.result, True
 
             ref = self._state.store.put(
@@ -109,13 +130,9 @@ class Ingestor:
                 request.declared_mime or "application/octet-stream",
             )
         ref.size = hasher.size
-        return await self._dispatch(
-            sha256, ref, hasher.size, request, probe.structural, traceparent
-        )
+        return await self._dispatch(sha256, ref, hasher.size, request, probe.structural)
 
-    async def ingest_ref(
-        self, request: ScanRequest, traceparent: str | None = None
-    ) -> tuple[ScanResult, bool]:
+    async def ingest_ref(self, request: ScanRequest) -> tuple[ScanResult, bool]:
         """Приём файла по ссылке — файл уже лежит в общем хранилище."""
         if request.source is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "не задан source")
@@ -124,12 +141,12 @@ class Ingestor:
 
         # sha256 по ссылке считает воркер: gateway не тянет тело ради хэша.
         pseudo = f"ref:{request.source.bucket}/{request.source.key}"
+        self._observe_accepted(self._resolve_profile(request), request.source.size or 0)
         return await self._dispatch(
             sha256=pseudo,
             ref=request.source,
             size=request.source.size or 0,
             request=request,
-            traceparent=traceparent,
         )
 
     def _resolve_profile(self, request: ScanRequest) -> str:
@@ -203,19 +220,41 @@ class Ingestor:
         return CacheProbe(result=result)
 
     @staticmethod
+    def _observe_accepted(profile: str, size: int) -> None:
+        """Размер принятого файла — на приёме, независимо от исхода.
+
+        Исход бывает трёх видов: ответ из кэша, синхронный вердикт и уход в
+        `202` с коллбэком. Первый и третий до вердикта в gateway не доходят,
+        поэтому измерение, привязанное к вердикту, описывало бы только
+        середину — файлы, которые успели в `wait_ms`, то есть лёгкие. Метрика
+        заведена (M10.11) объяснять уехавший p95, а объясняют его как раз
+        тяжёлые.
+        """
+        if size <= 0:
+            # Приём по ссылке: размер знает воркер, gateway тело не тянет.
+            # Ноль в гистограмме — не наблюдение, а испорченная нижняя корзина.
+            return
+        metrics().input_bytes.labels(profile=profile).observe(size)
+
+    @staticmethod
     def _observe_verdict(
         result: ScanResult,
         request: ScanRequest,
         profile: str,
-        cached: CachedStructural | None,
+        cached: str,
         elapsed_s: float,
-        size: int = 0,
     ) -> None:
-        """Время до вердикта, а не латентность API.
+        """Вердикт, отданный **самим gateway**, — то есть ответ из кэша.
+
+        Всё остальное считает воркер: он единственный видит и те сканы, что
+        успели в `wait_ms`, и те, что ушли в коллбэк. Считать здесь и там
+        значило бы считать синхронные дважды, а считать только здесь — не
+        считать асинхронные вовсе. Ровно так и было: `vs_scans_total` описывал
+        полосу между кэшем и дедлайном, а алерт на долю вредоносных делил одно
+        смещённое число на другое.
 
         Меряется здесь, а не в middleware: middleware видит длительность
-        запроса, включая чтение тела, и не отличает ответ из кэша от полного
-        прохода.
+        запроса целиком, вместе с чтением тела.
         """
         current = metrics()
         current.scans.labels(
@@ -223,12 +262,7 @@ class Ingestor:
             tenant=tenant_label(request.tenant),
             mode=request.mode.value,
         ).inc()
-        current.verdict_seconds.labels(
-            profile=profile, cached=str(cached is not None).lower()
-        ).observe(elapsed_s)
-        # Рядом со временем и в том же месте: разъехавшись, они перестают
-        # отвечать на вопрос «стало медленнее или стало тяжелее».
-        current.input_bytes.labels(profile=profile).observe(size)
+        current.verdict_seconds.labels(profile=profile, cached=cached).observe(elapsed_s)
 
     async def _record_history(self, result: ScanResult, request: ScanRequest, size: int) -> None:
         """Отправляет запись в поток истории.
@@ -245,6 +279,7 @@ class Ingestor:
                     detected_mime=result.facts.detected_mime if result.facts else None,
                     rules_version=await self._state.rules_version(),
                     av_db_version=await self._state.engine_version(),
+                    traceparent=current_traceparent() or "",
                 )
             )
         except Exception:
@@ -257,7 +292,6 @@ class Ingestor:
         size: int,
         request: ScanRequest,
         cached: CachedStructural | None = None,
-        traceparent: str | None = None,
     ) -> tuple[ScanResult, bool]:
         ext = PurePosixPath(request.filename).suffix.lower()[:16] if request.filename else None
 
@@ -282,6 +316,7 @@ class Ingestor:
                 "превышен предел одновременных проверок",
                 extra={"tenant": request.tenant, "limit": policy.max_concurrent_scans},
             )
+            metrics().rejections.labels(reason="concurrency").inc()
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "слишком много одновременных проверок",
@@ -290,15 +325,13 @@ class Ingestor:
 
         with (
             log_context(scan_id=scan_id, sha=short(sha256), tenant=request.tenant),
-            # Спан приёма. Корневым он становится только тогда, когда клиент
-            # не прислал контекст: у бота и у SDK трейс начинается раньше, на
-            # их стороне, и без продолжения дерево рвалось бы на HTTP-границе —
-            # через очередь мы контекст протаскиваем, а через HTTP не
-            # протаскивали вовсе.
-            #
-            # Негодный заголовок не принимается: начнётся новый корень.
-            continue_trace(
-                traceparent,
+            # Обычный вложенный спан, а не продолжение чужого контекста. Контекст
+            # от клиента принимает `tracing_middleware` — единственная точка, где
+            # он вообще принимается. `continue_trace` здесь ставил бы родителя
+            # заново, из заголовка, и спан приёма оказывался бы не потомком
+            # серверного спана, а его братом: чтение тела и заливка в S3 висели
+            # бы в дереве отдельно от того, ради чего они делались.
+            span(
                 "scan.accept",
                 scan_id=scan_id,
                 tenant=tenant_label(request.tenant),
@@ -356,7 +389,9 @@ class Ingestor:
                     "синхронный ответ",
                     extra={"elapsed_ms": int(elapsed_s * 1000), "duplicate": duplicate},
                 )
-                self._observe_verdict(result, request, profile.value, cached, elapsed_s, size)
+                # Вердикт здесь не считается: этот скан прошёл через воркер, и
+                # считает его воркер — вместе с теми, что не успели в `wait_ms`
+                # и ушли коллбэком. См. `_observe_verdict`.
                 return result, True
 
             logger.debug("дедлайн синхронного ответа истёк, уходим в коллбэк")

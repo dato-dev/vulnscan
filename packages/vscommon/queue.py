@@ -13,7 +13,14 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from vscommon.models import CallbackTask, DeadLetter, ScanJob, ScanRecord, ScanResult
+from vscommon.models import (
+    CallbackTask,
+    DeadLetter,
+    DeliveryTask,
+    ScanJob,
+    ScanRecord,
+    ScanResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -317,13 +324,24 @@ class ResultStream:
         return int(info.get("pending", 0)) if isinstance(info, dict) else 0
 
 
-class CallbackQueue:
-    """Очередь доставки результатов клиентам.
+class TaskStream[TaskT: (CallbackTask, DeliveryTask)]:
+    """Поток заданий с отложенными повторами.
 
     Два хранилища на одну задачу: поток для новых заданий и упорядоченное
     множество для отложенных повторов. Держать повторы в самом потоке нельзя —
     он выдаёт сообщения сразу, а нам нужно «через четыре минуты».
+
+    Обобщён по типу задания, потому что у доставки коллбэка и у выгрузки файла
+    механика одна и та же, а очереди нужны разные: недоступный приёмник одного
+    тенанта не должен задерживать уведомления остальным. Копия того же кода под
+    вторым именем разошлась бы с оригиналом молча.
+
+    Список типов задан явно, а не через `BaseModel`: обобщать механику повторов
+    на что попало не требуется, а перечисление показывает, что именно через неё
+    ходит.
     """
+
+    model: type[TaskT]
 
     def __init__(self, redis: Redis, stream: str, group: str, maxlen: int = 50_000) -> None:
         self._redis = redis
@@ -340,7 +358,7 @@ class CallbackQueue:
             if "BUSYGROUP" not in str(exc):
                 raise
 
-    async def publish(self, task: CallbackTask) -> str:
+    async def publish(self, task: TaskT) -> str:
         entry_id: str = await self._redis.xadd(
             self._stream,
             {"task": task.model_dump_json()},
@@ -351,7 +369,7 @@ class CallbackQueue:
 
     async def consume(
         self, consumer: str, block_ms: int = 2_000
-    ) -> AsyncIterator[tuple[str, CallbackTask]]:
+    ) -> AsyncIterator[tuple[str, TaskT]]:
         while True:
             try:
                 batches = await self._redis.xreadgroup(
@@ -371,7 +389,7 @@ class CallbackQueue:
                 for entry_id, fields in entries:
                     raw = fields.get("task") or fields.get(b"task")
                     try:
-                        yield entry_id, CallbackTask.model_validate_json(raw)
+                        yield entry_id, self.model.model_validate_json(raw)
                     except ValueError:
                         logger.exception("нераспознанное задание доставки, ack и пропуск")
                         await self.ack(entry_id)
@@ -379,11 +397,11 @@ class CallbackQueue:
     async def ack(self, entry_id: str) -> None:
         await self._redis.xack(self._stream, self._group, entry_id)
 
-    async def schedule_retry(self, task: CallbackTask, delay_s: float) -> None:
+    async def schedule_retry(self, task: TaskT, delay_s: float) -> None:
         """Откладывает повтор. Задание хранится целиком в множестве."""
         await self._redis.zadd(self._retry_key, {task.model_dump_json(): time.time() + delay_s})
 
-    async def due_retries(self, limit: int = 32) -> list[CallbackTask]:
+    async def due_retries(self, limit: int = 32) -> list[TaskT]:
         """Забирает задания, которым пора. Забранное сразу удаляется.
 
         Удаление до попытки, а не после: иначе два экземпляра notifier взяли бы
@@ -395,16 +413,28 @@ class CallbackQueue:
             return []
         await self._redis.zrem(self._retry_key, *raw)
 
-        tasks: list[CallbackTask] = []
+        tasks: list[TaskT] = []
         for item in raw:
             try:
-                tasks.append(CallbackTask.model_validate_json(item))
+                tasks.append(self.model.model_validate_json(item))
             except ValueError:
                 logger.exception("нераспознанное отложенное задание, пропуск")
         return tasks
 
     async def pending_retries(self) -> int:
         return int(await self._redis.zcard(self._retry_key))
+
+
+class CallbackQueue(TaskStream[CallbackTask]):
+    """Очередь доставки результатов клиентам."""
+
+    model = CallbackTask
+
+
+class DeliveryQueue(TaskStream[DeliveryTask]):
+    """Очередь выгрузки обезвреженных копий в хранилище клиента (M14)."""
+
+    model = DeliveryTask
 
 
 def _step_back(entry_id: str) -> str:

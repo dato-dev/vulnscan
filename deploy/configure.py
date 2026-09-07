@@ -61,8 +61,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "packages"))
 
 try:
+    from vscommon.delivery import DeliveryError, parse_delivery
     from vscommon.keys import MIN_SECRET_LEN, KeyRegistry
     from vscommon.models import CdrProfile, FailMode, Severity, TenantPolicy
+    from vscommon.policy import build_policy
     from vscommon.weights import DEFAULT_WEIGHTS
 except ImportError as exc:  # pragma: no cover — проверяется глазами, не тестом
     sys.stderr.write(
@@ -272,6 +274,36 @@ def p_scores(raw: str) -> dict[str, int]:
 
 def show_scores(value: dict[str, int]) -> str:
     return ", ".join(f"{code}={score}" for code, score in value.items()) if value else "—"
+
+
+def p_delivery(raw: str) -> dict[str, str]:
+    """Приёмник обезвреженных копий: `bucket=clean, credentials_id=team-drop`.
+
+    Разбирается настоящим загрузчиком сервиса, а не копией формата. Копия
+    разошлась бы с ним молча: мастер сохранял бы то, что сервис потом не
+    прочитает, и узнать об этом можно было бы только по отсутствию файлов в
+    приёмнике.
+    """
+    fields: dict[str, str] = {}
+    for chunk in re.split(r"[,\s]+", raw.strip()):
+        if not chunk:
+            continue
+        if "=" not in chunk:
+            raise BadValueError(f"«{chunk}» — нужно ПОЛЕ=ЗНАЧЕНИЕ, например bucket=clean")
+        name, _, value = chunk.partition("=")
+        fields[name.strip()] = value.strip()
+
+    try:
+        parse_delivery(fields)
+    except DeliveryError as exc:
+        raise BadValueError(str(exc)) from None
+    return fields
+
+
+def show_delivery(value: dict[str, str] | None) -> str:
+    if not value:
+        return "— (копию забирают у нас)"
+    return ", ".join(f"{name}={item}" for name, item in value.items())
 
 
 # ─────────────────────────────── диалог ────────────────────────────────────
@@ -502,12 +534,56 @@ def verify_policies(path: Path) -> list[str]:
     except ValueError as exc:
         return [f"{path.name}: не разбирается как JSON ({exc})"]
     problems: list[str] = []
+    destinations: dict[tuple[str, str], str] = {}
+
     for tenant, payload in entries(raw).items():
         try:
-            TenantPolicy.model_validate({**payload, "tenant": tenant})
+            # Той же функцией, что и сервис. Своя проверка разошлась бы с ним:
+            # первая версия объявляла негодной всю политику там, где сервис
+            # сохраняет пороги и помечает сломанным только приёмник.
+            policy = build_policy(TenantPolicy(), tenant, payload)
         except Exception as exc:
             first = str(exc).splitlines()[-1].strip()
             problems.append(f"{path.name}: политика «{tenant}» негодна — {first}")
+            continue
+
+        if policy.delivery_error:
+            cause = policy.delivery_error.splitlines()[0]
+            problems.append(f"{path.name}: приёмник «{tenant}» негоден — {cause}")
+            continue
+        if policy.delivery is None:
+            continue
+
+        problems.extend(_check_destination(path.name, tenant, policy.delivery, destinations))
+
+    return problems
+
+
+def _check_destination(
+    where: str, tenant: str, delivery: Any, seen: dict[tuple[str, str], str]
+) -> list[str]:
+    """Приёмник разбирается загрузчиком, а тут проверяется его разграничение.
+
+    Формально это годная конфигурация, поэтому загрузчик её принимает.
+    Практически — способ смешать документы двух клиентов в одном каталоге и
+    выдать учётную запись, которой можно писать в чужое.
+    """
+    problems: list[str] = []
+    place = (delivery.bucket, delivery.prefix.strip("/"))
+
+    if not delivery.prefix.strip("/"):
+        problems.append(
+            f"{where}: у приёмника «{tenant}» нет prefix — учётной записью можно "
+            f"писать в весь бакет; префикс на тенанта ограничивает ущерб от её утечки"
+        )
+
+    neighbour = seen.get(place)
+    if neighbour is not None:
+        problems.append(
+            f"{where}: «{tenant}» и «{neighbour}» пишут в один каталог "
+            f"({delivery.bucket}/{place[1] or ''}) — документы двух клиентов смешаются"
+        )
+    seen[place] = tenant
     return problems
 
 
@@ -782,6 +858,24 @@ POLICY_PARAMS: tuple[Param, ...] = (
         "рано или поздно стало бы «отправляем как есть», причём тихо.",
         p_choice(["block", "mark"]),
         default="block",
+    ),
+    Param(
+        "delivery",
+        "куда складывать обезвреженную копию",
+        "ПОЛЕ=ЗНАЧЕНИЕ через запятую, «-» — никуда",
+        "Пусто — копию забирают у нас через API, и через сутки её не станет. "
+        "Заполнено — копия уезжает в ваше хранилище, и хранить её перестаём мы.\n"
+        "Обязательны bucket и credentials_id. Необязательны endpoint, region и "
+        "prefix — свой префикс на тенанта стоит задать: он ограничивает, куда "
+        "можно писать, если учётку скомпрометируют.\n"
+        "credentials_id — ССЫЛКА на учётные данные, а не они сами. Ключи лежат "
+        "в отдельном файле, который читает только notifier: этот каталог видят "
+        "и воркеры, а им ключ от вашего хранилища знать незачем.\n"
+        "Пример: bucket=incoming-clean, prefix=vulnscan/, credentials_id=team-drop",
+        p_delivery,
+        default=None,
+        render=show_delivery,
+        empty=None,
     ),
     Param(
         "weight_overrides",

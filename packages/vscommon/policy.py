@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 
 from vscommon.config import CommonSettings
+from vscommon.delivery import DeliveryError, parse_delivery
 from vscommon.limits import MAX_UPLOAD_BYTES
 from vscommon.models import CdrProfile, FailMode, TenantPolicy
 
@@ -27,6 +28,49 @@ def upload_limit_for(policy: TenantPolicy) -> int:
 
 
 logger = logging.getLogger(__name__)
+
+
+def build_policy(base: TenantPolicy, tenant: str, payload: dict[str, object]) -> TenantPolicy:
+    """Собирает политику тенанта поверх базовой.
+
+    Блок `delivery` разбирается отдельно и строго, а не вместе с остальным. У
+    `TenantPolicy` мягкий разбор: неизвестные поля отбрасываются, и это
+    правильно — так клиент не подсунет себе `on_timeout: fail-open`. Но для
+    приёмника мягкость означала бы, что опечатка в имени поля превращается в
+    «доставка не настроена», и файлы перестают появляться в ящике при
+    исправном с виду сервисе.
+
+    Публичная намеренно: этой же функцией проверяет файл `deploy/configure.py`.
+    Своя копия правил в мастере разошлась бы с загрузчиком и начала одобрять
+    то, что сервис отвергнет, — или наоборот, как и случилось при первой
+    попытке: мастер объявлял негодной всю политику там, где сервис сохранял
+    пороги и помечал сломанным только приёмник.
+
+    Поэтому негодный блок не отбрасывается и не роняет остальную политику: он
+    запоминается как `delivery_error`. Пороги тенанта остаются в силе —
+    заменить их умолчаниями из-за опечатки в адресе означало бы ослабить
+    проверку там, где сломана выдача.
+    """
+    merged = {**base.model_dump(), **payload, "tenant": tenant}
+
+    described = merged.pop("delivery", None)
+    merged["delivery"] = None
+    merged["delivery_error"] = ""
+
+    policy = TenantPolicy.model_validate(merged)
+    if described is None:
+        return policy
+
+    try:
+        policy.delivery = parse_delivery(described)
+    except DeliveryError as exc:
+        policy.delivery_error = str(exc)
+        logger.error(
+            "приёмник тенанта описан негодно, доставка выполняться не будет",
+            extra={"tenant": tenant, "причина": str(exc)},
+        )
+    return policy
+
 
 
 class PolicyRegistry:
@@ -87,9 +131,7 @@ class PolicyRegistry:
                 try:
                     raw = json.loads(path.read_text())
                     for tenant, payload in raw.items():
-                        overrides[tenant] = TenantPolicy.model_validate(
-                            {**default.model_dump(), **payload, "tenant": tenant}
-                        )
+                        overrides[tenant] = build_policy(default, tenant, payload)
                     logger.info("политики тенантов загружены", extra={"tenants": len(overrides)})
                 except Exception:
                     degraded = True
@@ -102,9 +144,7 @@ class PolicyRegistry:
         for tenant, payload in (managed or {}).items():
             base = overrides.get(tenant, default)
             try:
-                overrides[tenant] = TenantPolicy.model_validate(
-                    {**base.model_dump(), **payload, "tenant": tenant}
-                )
+                overrides[tenant] = build_policy(base, tenant, payload)
             except Exception:
                 # Одна негодная запись не должна ронять политики остальных.
                 logger.exception(

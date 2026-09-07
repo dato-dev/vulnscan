@@ -116,8 +116,19 @@ DD_SEMGREP_SPEC=${DD_SEMGREP_SPEC:-semgrep==1.176.1}
 # переменная не выставляется.
 DD_SEMGREP_LIBGCC=${DD_SEMGREP_LIBGCC:-/lib64/libgcc_s.so.1}
 
+# Поиск секретов. Отдельная цель, а не часть sast: trivy и semgrep смотрят
+# рабочее дерево, gitleaks — историю git. Секрет, закоммиченный и удалённый
+# следующим коммитом, из рабочего дерева исчезает, а из истории нет, и
+# заметить его можно только так.
+DD_SECRETS_ENGAGEMENT=${DD_SECRETS_ENGAGEMENT:-secrets}
+# Значения найденных секретов в отчёт не попадают. Находка и без них несёт
+# всё нужное — правило, файл, строку, коммит, автора, — а отчёт уезжает в
+# DefectDojo, живёт там годами и виден всем, у кого есть доступ. Класть
+# рабочий ключ в трекер, чтобы потом вычищать его оттуда, — плохой размен.
+DD_GITLEAKS_REDACT=${DD_GITLEAKS_REDACT:-1}
+
 SERVICES_ALL="gateway worker bot notifier writer cvdmirror"
-TARGETS_DEFAULT="$SERVICES_ALL repo sast"
+TARGETS_DEFAULT="$SERVICES_ALL repo sast secrets"
 
 fail=0
 say() { printf '  ok    %s\n' "$1"; }
@@ -138,7 +149,8 @@ targets=$*
 # прогоне одного SAST — значит не дать запустить SAST там, где trivy не стоит.
 need_trivy=0
 for t in $targets; do
-	[ "$t" = "sast" ] || need_trivy=1
+	# sast и secrets обходятся без trivy — не требуем его ради них.
+	case "$t" in sast | secrets) ;; *) need_trivy=1 ;; esac
 done
 
 echo "DefectDojo: ${DD_URL:-<не задан>}"
@@ -364,6 +376,26 @@ scan_sast() {
 		push "vulnscantg-repo" "repo" "$out" "Semgrep JSON Report" "$DD_SAST_ENGAGEMENT"
 }
 
+scan_secrets() {
+	if ! command -v gitleaks >/dev/null 2>&1; then
+		bad "gitleaks недоступен — brew install gitleaks, либо шаг установки в CI"
+		return 0
+	fi
+	if [ ! -d .git ]; then
+		bad "gitleaks: каталог не git-репозиторий, историю смотреть негде"
+		return 0
+	fi
+	out="$work/gitleaks.json"
+	set -- gitleaks git --no-banner --report-format json --report-path "$out"
+	[ "$DD_GITLEAKS_REDACT" = "1" ] && set -- "$@" --redact
+	set -- "$@" .
+	commits=$(git rev-list --count HEAD 2>/dev/null || echo 0)
+	# gitleaks возвращает 1 при находках — судим по файлу, как и для bandit.
+	# Отчёт он пишет даже при нуле находок, так что пустого файла тут не бывает.
+	run_sast "gitleaks — история git ($commits коммитов)" "$out" "$@" &&
+		push "vulnscantg-repo" "repo" "$out" "Gitleaks Scan" "$DD_SECRETS_ENGAGEMENT"
+}
+
 scan_image() { # сервис
 	svc=$1
 	image="$IMAGE_NAMESPACE/vulnscantg-$svc:$IMAGE_TAG"
@@ -411,10 +443,11 @@ for target in $targets; do
 	case "$target" in
 	repo) scan_repo || true ;;
 	sast) scan_sast || true ;;
+	secrets) scan_secrets || true ;;
 	*)
 		case " $SERVICES_ALL " in
 		*" $target "*) scan_image "$target" || true ;;
-		*) bad "$target — неизвестная цель (есть: $SERVICES_ALL repo sast)" ;;
+		*) bad "$target — неизвестная цель (есть: $SERVICES_ALL repo sast secrets)" ;;
 		esac
 		;;
 	esac
