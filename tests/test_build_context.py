@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import fnmatch
+import pathlib
 import re
 from pathlib import Path
 
@@ -398,3 +399,86 @@ def test_parsers_do_not_leak_into_other_images() -> None:
     }
 
     assert not leaked, f"разбор недоверенного ввода попал в чужой образ: {leaked}"
+
+
+# --- стенд сквозного прогона ----------------------------------------------
+
+E2E = ROOT / "tests" / "e2e"
+
+
+def _e2e_compose() -> dict:
+    import yaml
+
+    return yaml.safe_load((E2E / "docker-compose.yml").read_text())
+
+
+def _stand_expects() -> dict[str, pathlib.Path]:
+    """Файлы, которые сервисы стенда ищут по своим переменным окружения.
+
+    Список берётся из compose, а не пишется руками: новая переменная с путём
+    внутри смонтированного каталога попадает под проверку сама. Руками список
+    отстал бы ровно тогда, когда появился бы новый файл, — то есть в момент,
+    когда проверка нужнее всего.
+    """
+    wanted: dict[str, pathlib.Path] = {}
+    for name, service in _e2e_compose()["services"].items():
+        mounts = {
+            str(volume).split(":")[1]: pathlib.Path(str(volume).split(":")[0])
+            for volume in (service.get("volumes") or [])
+            if str(volume).startswith("./")
+        }
+        for key, value in (service.get("environment") or {}).items():
+            if not key.endswith("_FILE") or not isinstance(value, str):
+                continue
+            for inside, outside in mounts.items():
+                if value.startswith(inside + "/"):
+                    wanted[f"{name}:{key}"] = E2E / outside / value[len(inside) + 1 :]
+    return wanted
+
+
+def test_stand_generates_every_file_it_needs() -> None:
+    """Всё, что сервисы стенда ищут, генератор создаёт.
+
+    Регрессия, ради которой: `keys.json` и `delivery.json` исключены
+    `.gitignore` — правило защищает боевые ключи от попадания в git, и трогать
+    его нельзя. Файлы стенда попали под то же правило: локально прогон шёл, на
+    раннере падал `FileNotFoundError`. Лечится не исключением в правиле, а тем,
+    что стенд готовит конфигурацию сам.
+    """
+    import subprocess
+
+    expected = _stand_expects()
+    assert expected, "из compose не извлеклось ни одного файла — проверка смотрит не туда"
+
+    for path in expected.values():
+        path.unlink(missing_ok=True)
+
+    subprocess.run(
+        [str(ROOT / ".venv" / "bin" / "python"), str(E2E / "configure_stand.py")],
+        check=True,
+        capture_output=True,
+        cwd=ROOT,
+    )
+
+    missing = {name: str(path) for name, path in expected.items() if not path.is_file()}
+
+    assert not missing, f"сервис ищет файл, которого генератор не создаёт: {missing}"
+
+
+def test_stand_config_is_not_committed() -> None:
+    """Сгенерированное не должно попадать в репозиторий.
+
+    Иначе однажды туда уедет настоящий ключ: файл с тем же именем в том же
+    месте, только с боевым секретом.
+    """
+    import subprocess
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "tests/e2e/config", "tests/e2e/secrets"],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        check=False,
+    ).stdout.split()
+
+    assert not tracked, f"конфигурация стенда попала в git: {tracked}"

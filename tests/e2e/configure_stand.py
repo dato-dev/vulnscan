@@ -1,4 +1,4 @@
-"""Настраивает приёмник стенда: MinIO по умолчанию или чужое хранилище.
+"""Готовит конфигурацию стенда: ключи, политику и учётные данные приёмника.
 
 Зачем параметризация. MinIO проверяет нашу логику, но не проверяет **чужой
 S3**: подпись, регион, поведение при отказе в правах у каждого провайдера свои.
@@ -20,6 +20,13 @@ S3**: подпись, регион, поведение при отказе в п
 Префикс задаётся снаружи и должен быть уникальным на прогон. Учётка сервиса —
 только на запись, удалять за собой она не может; в боевом бакете уборку делает
 правило жизненного цикла, а не тест.
+
+Почему конфигурация ГЕНЕРИРУЕТСЯ, а не лежит в репозитории. `.gitignore`
+исключает `keys.json` и всё, в пути чего есть `secret`, — и правильно делает:
+это защита от того, чтобы боевые ключи уехали в git. Файлы стенда попали под то
+же правило, и на раннере их не оказалось: локально прогон шёл, в CI падал с
+`FileNotFoundError`. Заводить исключения в правиле нельзя — оно охраняет вещь
+поважнее удобства стенда. Поэтому стенд готовит себе конфигурацию сам.
 """
 
 from __future__ import annotations
@@ -34,6 +41,12 @@ ROOT = HERE.parent.parent
 sys.path.insert(0, str(ROOT / "packages"))
 
 CREDENTIALS_ID = "telegram-bot-1"
+TENANT = "telegram-bot"
+
+# Секрет стенда. Не тайна: стенд живёт минуты и гасится вместе с прогоном, а
+# ключ не выходит за пределы его сети. Длина — не меньше `MIN_SECRET_LEN`,
+# иначе реестр ключей запись не примет.
+STAND_SECRET = "e2e-стенд-секрет-не-настоящий-минимум-32-символа"
 
 DEFAULTS = {
     "endpoint": "http://minio:9000",
@@ -82,6 +95,43 @@ def main() -> int:
     policy = build_policy(TenantPolicy(), "telegram-bot", policies["telegram-bot"])
     if policy.delivery is None:
         raise SystemExit(f"политика стенда негодна: {policy.delivery_error}")
+
+    config = HERE / "config"
+    config.mkdir(exist_ok=True)
+
+    keys = {
+        "_": ["Ключи стенда. Генерируются: см. заголовок модуля."],
+        CREDENTIALS_ID: {
+            "tenant": TENANT,
+            "secret": STAND_SECRET,
+            "callback_hosts": [],
+            "disabled": False,
+        },
+    }
+    # Проверяем настоящим реестром: стенд с непринятым ключом отвечал бы 401 на
+    # каждую загрузку, и разбор начинался бы с подписи вместо конфигурации.
+    keys_file = config / "keys.json"
+    keys_file.write_text(json.dumps(keys, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    keys_file.chmod(0o600)
+
+    from vscommon.keys import KeyRegistry
+
+    registry = KeyRegistry.load(str(keys_file))
+    if registry.get(CREDENTIALS_ID) is None:
+        raise SystemExit("ключ стенда не принят реестром — проверьте длину секрета")
+
+    # Пустая таблица весов. Файл нужен не ради значений, а ради того, чтобы
+    # воркер не писал в каждом прогоне «файл весов не найден»: предупреждение
+    # об исправной настройке приучает не читать предупреждения.
+    (config / "weights.json").write_text(
+        json.dumps(
+            {"_": ["Стенд работает на встроенных весах: переопределять нечего."]},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
     (HERE / "config" / "policies.json").write_text(
         json.dumps(policies, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

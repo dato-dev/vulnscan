@@ -102,6 +102,13 @@ jobs:
         # правами только на запись, и подменять одну другой нельзя.
         run: uv sync --frozen --all-groups
 
+      - name: Настроить стенд
+        # Ключи, политика и учётные данные приёмника генерируются: в
+        # репозитории их нет, `.gitignore` исключает `keys.json` и всё с
+        # `secret` в пути. Первый прогон на раннере упал именно поэтому —
+        # локально файлы были, в CI их не оказалось.
+        run: .venv/bin/python tests/e2e/configure_stand.py
+
       - name: Поднять стенд
         # `--build` обязателен: прогон по опубликованному тегу воспроизводил
         # бы расхождение кода и образа вместе с ошибкой, а половина найденного
@@ -206,7 +213,7 @@ jobs:
           # а не тест. Без разделения прогоны видели бы объекты друг друга и
           # проходили по чужим файлам.
           E2E_SINK_PREFIX: e2e/${{ github.run_id }}/
-        run: .venv/bin/python tests/e2e/configure_sink.py
+        run: .venv/bin/python tests/e2e/configure_stand.py
 
       - name: Поднять стенд
         if: steps.ready.outputs.ready == 'true'

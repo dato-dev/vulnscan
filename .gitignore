@@ -28,6 +28,14 @@ deploy/secrets/*.json
 !deploy/secrets/*.example.json
 proxy.env
 *secret*
+
+# Конфигурация сквозного стенда генерируется перед прогоном
+# (tests/e2e/configure_stand.py) и в репозиторий не едет. Правила выше и так
+# исключают `keys.json` и всё с `secret` в пути — здесь то же сказано явно,
+# чтобы отсутствие файлов читалось как замысел, а не как потеря. Именно на
+# этом упал первый прогон в CI: локально файлы были, на раннере их не было.
+tests/e2e/config/*.json
+tests/e2e/secrets/*.json
 *.pem
 *.key
 !*.example.json
