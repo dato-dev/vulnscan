@@ -118,7 +118,7 @@ class Delivery(BaseModel):
             # Единственное значение, пришедшее от пользователя. Запасное —
             # `scan_id`: он уникален, и подстановка пустоты дала бы пустой
             # сегмент ключа, то есть остановку доставки на одном кривом имени.
-            filename=safe_filename(filename, scan_id),
+            filename=safe_filename(_without_ext(filename, ext), scan_id),
         )
         return _safe_key(rendered)
 
@@ -169,6 +169,23 @@ MAX_FILENAME = 80
 часть: за ним ещё префикс, дата и расширение."""
 
 
+def _without_ext(raw: str, ext: str) -> str:
+    """Убирает расширение — его подставит `{ext}`.
+
+    Срезается ИМЕННО то расширение, которое определил gateway, а не «всё после
+    последней точки». Разница видна на `Договор от 12.05.2026.pdf`: угадывание
+    по точке оставило бы `Договор от 12.05`, потеряв год. Гадать здесь нечего —
+    расширение уже посчитано, и оно едет рядом.
+
+    Без этого шага `{filename}...{ext}` давал `Договор.pdf-Проверено-clean.pdf`:
+    расширение в середине имени. Документация обещала обратное, а поймал это
+    сквозной стенд (M13.0) — на живом бакете, а не в утверждении о нём.
+    """
+    if ext and raw.lower().endswith(ext.lower()):
+        return raw[: -len(ext)]
+    return raw
+
+
 def safe_filename(raw: str, fallback: str) -> str:
     """Имя пользователя, пригодное для ключа объекта.
 
@@ -185,6 +202,7 @@ def safe_filename(raw: str, fallback: str) -> str:
     """
     cleaned = _SPACES.sub(" ", _UNSAFE.sub("", raw)).strip(" .")
     return cleaned[:MAX_FILENAME].strip(" .") or fallback
+
 
 _PLACEHOLDER = re.compile(r"\{([a-z_]*)\}")
 
@@ -246,6 +264,14 @@ def parse_delivery(payload: Any) -> Delivery:
     if unknown:
         raise DeliveryError(
             f"в key_template неизвестные подстановки: {unknown}; допустимы {list(TOKENS)}"
+        )
+    if "{filename}" in delivery.key_template and "{ext}" not in delivery.key_template:
+        # Имя подставляется без расширения, поэтому дописать его обязан шаблон.
+        # Молчаливая потеря расширения выглядит как исправная доставка: объекты
+        # в ящике есть, а открыть их двойным щелчком нельзя.
+        raise DeliveryError(
+            "в key_template есть {filename}, но нет {ext}: имя подставляется без "
+            "расширения, и объекты уехали бы в бакет без него"
         )
     if "{" in _PLACEHOLDER.sub("", delivery.key_template):
         # Незакрытая скобка: `{scan_id{ext}` разберётся во что угодно, только

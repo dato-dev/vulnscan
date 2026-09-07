@@ -396,6 +396,67 @@ def test_the_name_from_the_user_is_sanitised() -> None:
     assert "\n" not in control
 
 
+def test_the_extension_is_not_doubled() -> None:
+    """`{filename}` даёт имя БЕЗ расширения — дописывает его `{ext}`.
+
+    Иначе шаблон, ради которого подстановка и заведена, даёт расширение в
+    середине: `Договор аренды.pdf-Проверено-clean.pdf`. Документация обещала
+    обратное с самого начала, а поймал расхождение сквозной стенд — на живом
+    бакете, где имя объекта видно глазами.
+    """
+    from vscommon.delivery import parse_delivery
+
+    delivery = parse_delivery(
+        {
+            "bucket": "b",
+            "credentials_id": "c",
+            "key_template": "{filename}-Проверено-{verdict}{ext}",
+        }
+    )
+
+    name = delivery.object_name("s1", "a" * 64, "clean", ".pdf", 0.0, "Договор аренды.pdf")
+
+    assert name == "Договор аренды-Проверено-clean.pdf"
+
+
+def test_only_the_known_extension_is_cut() -> None:
+    """Срезается расширение, посчитанное gateway, а не всё после точки.
+
+    Гадание по последней точке съело бы год у `Договор от 12.05.2026.pdf` —
+    и это не редкий случай, а обычное имя договора.
+    """
+    from vscommon.delivery import parse_delivery
+
+    delivery = parse_delivery(
+        {"bucket": "b", "credentials_id": "c", "key_template": "{filename}{ext}"}
+    )
+
+    dated = delivery.object_name("s1", "a" * 64, "clean", ".pdf", 0.0, "Договор от 12.05.2026.pdf")
+    upper = delivery.object_name("s1", "a" * 64, "clean", ".pdf", 0.0, "СКАН.PDF")
+    # Расширения нет вовсе, а точки в имени есть. Гадание по последней точке
+    # оставило бы «Договор от 12.05» — без года и молча.
+    bare = delivery.object_name("s1", "a" * 64, "clean", "", 0.0, "Договор от 12.05.2026")
+
+    assert dated == "Договор от 12.05.2026.pdf"
+    assert upper == "СКАН.pdf", "расширение в другом регистре — то же расширение"
+    assert bare == "Договор от 12.05.2026"
+
+
+def test_a_template_with_a_name_must_say_where_the_extension_goes() -> None:
+    """`{filename}` без `{ext}` — негодная конфигурация, а не тихая потеря.
+
+    Имя подставляется без расширения, поэтому дописать его обязан шаблон. Без
+    проверки объекты уезжали бы в ящик без расширения, и это выглядело бы
+    исправной доставкой: файлы на месте, открыть двойным щелчком нельзя.
+    """
+    from vscommon.delivery import DeliveryError, parse_delivery
+
+    with pytest.raises(DeliveryError, match=r"\{ext\}"):
+        parse_delivery(
+            {"bucket": "b", "credentials_id": "c", "key_template": "{filename}-{verdict}"}
+        )
+
+
 def test_an_unusable_name_falls_back_to_the_scan_id() -> None:
     """Пустой сегмент в ключе отвергается — доставка встала бы на одном файле.
 
