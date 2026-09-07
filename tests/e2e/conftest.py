@@ -25,17 +25,31 @@ import pytest
 from stand import (
     READER_KEY,
     READER_SECRET,
+    REQUIRED,
     SINK_ENDPOINT,
     SINK_REGION,
     SKIP_REASON,
+    diagnose,
     ready,
+    wait_ready,
 )
 
 
 @pytest.fixture(scope="session", autouse=True)
 def stand() -> None:
-    if not ready():
-        pytest.skip(SKIP_REASON, allow_module_level=True)
+    # Ждём только там, где стенд обязателен. На машине разработчика его чаще
+    # всего нет вовсе, и трёхминутное ожидание перед пропуском превратило бы
+    # обычный прогон в наказание.
+    if wait_ready() if REQUIRED else ready():
+        return
+
+    detail = diagnose()
+    if REQUIRED:
+        # В CI стенд только что подняли. Пропуск здесь означал бы зелёную
+        # задачу, ничего не проверившую, — и первый же прогон именно это и
+        # показал: восемь тестов пропущены, доставка не проверена.
+        pytest.fail(f"стенд не отвечает готовностью, а прогон это требует.\n{detail}")
+    pytest.skip(f"{SKIP_REASON}\n{detail}", allow_module_level=True)
 
 
 @pytest.fixture(scope="session")

@@ -132,6 +132,24 @@ services:
       - ./config:/app/config:ro
     ports:
       - "18080:8080"
+    healthcheck:
+      # Проверка ГОТОВНОСТИ, а не факта запуска. Без неё `up --wait` считает
+      # стенд поднятым, как только контейнер стартовал, — а `/readyz` в этот
+      # момент ещё отдаёт 503: возраст антивирусных баз публикует воркер, и он
+      # стартует последним, дождавшись clamd. На первом же прогоне тесты
+      # попали ровно в эту щель и молча пропустились.
+      #
+      # curl в образе нет и не нужен: python здесь есть по определению.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request;urllib.request.urlopen('http://localhost:8080/readyz')"
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      # Готовность зависит от clamd: на пустом томе тот сперва тянет базы.
+      start_period: 420s
     depends_on:
       redis: {condition: service_healthy}
       minio: {condition: service_healthy}

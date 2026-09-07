@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,47 @@ SKIP_REASON = (
 def secret() -> str:
     keys = json.loads((HERE / "config" / "keys.json").read_text(encoding="utf-8"))
     return keys[KEY_ID]["secret"]
+
+
+REQUIRED = bool(os.environ.get("E2E_REQUIRE_STAND"))
+"""Стенд обязан быть поднят: прогон в CI.
+
+Без этого пропуск читается как успех. Ровно так и вышло на первом же прогоне:
+восемь тестов пропущены, задача зелёная, доставка не проверена. Пропуск уместен
+на машине разработчика, где Docker может быть не запущен, и недопустим там, где
+стенд только что подняли.
+"""
+
+
+def diagnose() -> str:
+    """Что именно ответил gateway. Для сообщения об отказе, а не для логики.
+
+    «Стенд не поднят» — плохой диагноз: контейнеры могут работать, а сервис
+    отвечать `503`. Разница между «нет стенда» и «стенд не готов» решается
+    по-разному, и путать их значит начинать разбор с неверной догадки.
+    """
+    try:
+        with urllib.request.urlopen(f"{GATEWAY}/readyz", timeout=5) as response:
+            return f"{response.status}: {response.read().decode()[:400]}"
+    except urllib.error.HTTPError as exc:
+        return f"{exc.code}: {exc.read().decode(errors='replace')[:400]}"
+    except Exception as exc:
+        return f"нет ответа: {exc!r}"
+
+
+def wait_ready(timeout_s: float = 180.0) -> bool:
+    """Ждёт готовности, а не спрашивает однажды.
+
+    Готовность приходит не сразу: `/readyz` отдаёт `503`, пока воркер не
+    опубликовал версию антивирусных баз, а воркер стартует последним — он ждёт
+    clamd. Один вопрос в момент запуска попадал ровно в эту щель.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if ready():
+            return True
+        time.sleep(2.0)
+    return False
 
 
 def ready() -> bool:

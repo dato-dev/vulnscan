@@ -64,6 +64,32 @@ jobs:
           # .git/config рабочего каталога до следующего запуска.
           persist-credentials: false
 
+      - name: Проверить доступ к Docker
+        # Отдельным шагом и первым. Без него прогон падает на `up` строкой
+        # «permission denied ... docker.sock», в которой не сказано ни кто
+        # запущен, ни чего не хватает, — и разбор начинается с гадания.
+        #
+        # Учётку раннера в workflow не выбрать: он работает от пользователя,
+        # под которым запущен его сервис. Нужны разные — поднимайте два
+        # раннера с разными метками и выбирайте меткой в `runs-on`.
+        run: |
+          set -eu
+          if docker info >/dev/null 2>&1; then
+            echo "docker доступен пользователю $(id -un)"
+            exit 0
+          fi
+          echo "::error::раннер работает от $(id -un), и доступа к docker.sock у него нет."
+          echo "Группы пользователя: $(id -Gn)"
+          echo
+          echo "Починка на хосте раннера:"
+          echo "  sudo usermod -aG docker $(id -un)"
+          echo "  sudo systemctl restart actions.runner.*"
+          echo
+          echo "ВАЖНО: членство в группе docker равносильно root — сокет позволяет"
+          echo "смонтировать корень хоста в контейнер. Раннер после этого стоит"
+          echo "считать привилегированным и не пускать на него чужой код."
+          exit 1
+
       - name: Поставить uv
         uses: astral-sh/setup-uv@v10.0.1
         with:
@@ -85,7 +111,18 @@ jobs:
       - name: Сэмплы
         run: .venv/bin/python samples/make_samples.py
 
+      - name: Готовность стенда
+        # Ответ /readyz печатается до прогона. Первый запуск пропустил все
+        # тесты, и понять почему было нельзя: в логе не осталось ни ответа
+        # сервиса, ни причины пропуска.
+        run: curl -sS -i http://localhost:18080/readyz | head -20
+
       - name: Прогон
+        env:
+          # Стенд только что подняли: пропуск здесь означал бы зелёную задачу,
+          # ничего не проверившую. Ровно это и случилось на первом прогоне —
+          # восемь тестов пропущены, доставка не проверена, галочка стоит.
+          E2E_REQUIRE_STAND: "1"
         run: .venv/bin/python -m pytest tests/e2e -v -p no:cacheprovider
 
       - name: Логи стенда при сбое
@@ -137,6 +174,15 @@ jobs:
             echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Проверить доступ к Docker
+        if: steps.ready.outputs.ready == 'true'
+        run: |
+          set -eu
+          docker info >/dev/null 2>&1 && exit 0
+          echo "::error::раннер работает от $(id -un) и не имеет доступа к docker.sock."
+          echo "  sudo usermod -aG docker $(id -un) && sudo systemctl restart actions.runner.*"
+          exit 1
+
       - name: Поставить uv
         if: steps.ready.outputs.ready == 'true'
         uses: astral-sh/setup-uv@v10.0.1
@@ -181,8 +227,9 @@ jobs:
           E2E_SINK_SECRET_KEY: ${{ secrets.E2E_SINK_SECRET_KEY }}
           # Читает приёмник ОТДЕЛЬНАЯ учётка: у сервиса права только на запись,
           # и подменять их админскими значило бы проверять не то, что поедет.
-          E2E_READER_ACCESS_KEY: ${{ secrets.E2E_SINK_ACCESS_KEY }}
-          E2E_READER_SECRET_KEY: ${{ secrets.E2E_SINK_SECRET_KEY }}
+          E2E_READER_ACCESS_KEY: ${{ secrets.E2E_READER_ACCESS_KEY }}
+          E2E_READER_SECRET_KEY: ${{ secrets.E2E_READER_SECRET_KEY }}
+          E2E_REQUIRE_STAND: "1"
         run: .venv/bin/python -m pytest tests/e2e -v -p no:cacheprovider
 
       - name: Логи стенда при сбое
