@@ -28,7 +28,8 @@
       "bucket": "incoming-clean",
       "prefix": "vulnscan/team-legal/",
       "region": "ru-central1",
-      "credentials_id": "team-legal-drop"
+      "credentials_id": "team-legal-drop",
+      "key_template": "{date}/{scan_id}{ext}"
     }
   }
 }

@@ -356,6 +356,14 @@ class Ingestor:
                         source=ref,
                         size=size,
                         filename_ext=ext,
+                        # Полное имя — только если приёмник тенанта его просит.
+                        # Иначе оно останется в Redis и в истории, а нужно
+                        # ровно расширение.
+                        filename=(
+                            request.filename
+                            if policy.delivery and policy.delivery.needs_filename
+                            else None
+                        ),
                         declared_mime=request.declared_mime,
                         mode=request.mode,
                         profile=profile,

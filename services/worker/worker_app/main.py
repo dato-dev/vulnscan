@@ -383,17 +383,36 @@ class Worker:
         if policy.delivery is None:
             return
 
+        # Копия заблокированного файла уезжает ТОЛЬКО по явной настройке.
+        # Проверять `result.sanitized is not None` было бы мало: углублённая
+        # проверка пересобирает заблокированное и без всякой доставки — чтобы
+        # выяснить, поддаётся ли документ безопасной пересборке вообще. Без
+        # этой ветки такой артефакт уехал бы клиенту как обычная копия.
+        blocked = result.verdict is Verdict.MALICIOUS
+        allowed = not blocked or policy.deliver_blocked == "strict"
+        artifact = result.sanitized.ref if (result.sanitized and allowed) else None
+
         try:
             await self._deliveries.publish(
                 DeliveryTask(
                     scan_id=result.scan_id,
                     tenant=job.tenant,
                     destination=policy.delivery,
-                    artifact=result.sanitized.ref if result.sanitized else None,
-                    # Исходное имя файла не используется: оно часто содержит
-                    # персональные данные, и мы его не храним. Сопоставить
+                    artifact=artifact,
+                    rebuilt_from_blocked=blocked and artifact is not None,
+                    # Имя собирается по шаблону приёмника. Исходное имя файла
+                    # в него не входит и входить не может: оно часто содержит
+                    # персональные данные, мы его не храним, а ключ объекта
+                    # оседает ещё и в логах доступа хранилища. Сопоставить
                     # объект с обращением клиент может по `scan_id` из манифеста.
-                    name=f"{result.scan_id}{job.filename_ext}",
+                    name=policy.delivery.object_name(
+                        scan_id=result.scan_id,
+                        sha256=result.sha256,
+                        verdict=result.verdict.value,
+                        ext=job.filename_ext or "",
+                        when=result.created_at,
+                        filename=job.filename or "",
+                    ),
                     payload=result.model_dump_json(),
                     traceparent=current_traceparent() or "",
                 )

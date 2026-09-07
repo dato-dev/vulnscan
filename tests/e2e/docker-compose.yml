@@ -1,0 +1,198 @@
+# Стенд для сквозного прогона доставки (ROADMAP M13.0).
+#
+#   make test-e2e
+#
+# Зачем он есть. Путь «файл принят → проверен → пересобран → выгружен в чужое
+# хранилище» ни разу не выполнялся целиком: в обычных тестах `boto3` подменён,
+# и заглушка проверяет наши представления о нём, а не работу. За неделю на этом
+# пути нашлись подряд: отсутствующая зависимость в образе, политика, названная
+# по идентификатору ключа, ссылка на несуществующую учётку, поле, которого нет
+# в выкаченном образе. Каждый раз симптом был один и тот же — сервис работает,
+# файлы не приходят.
+#
+# Образы собираются ИЗ ЭТОГО ЖЕ ДЕРЕВА, а не тянутся по тегу. Половина
+# найденного была расхождением кода и выкаченного образа; прогон по тегу это
+# расхождение воспроизводил бы вместе с ошибкой.
+#
+# clamd здесь настоящий. Базы он тянет сам, и первый старт занимает минуты —
+# зато том `clamav-db` живёт между прогонами, и на своём раннере эта цена
+# платится один раз. Обойтись без него нельзя: `clamav` входит в
+# `ESSENTIAL_STAGES`, то есть без него не проверяется главное правило сервиса —
+# вердикт `clean` требует, чтобы обязательные стадии отработали. С выключенным
+# антивирусом прогон подтверждал бы работу конвейера, которого в бою нет.
+#
+# Чего здесь нет и почему:
+#
+# * writer и PostgreSQL — история проверок к доставке отношения не имеет, а её
+#   цепочка уже покрыта `tests/integration`;
+# * бота нет: он клиент, а не часть сервиса;
+# * cvdmirror нет: он существует, чтобы за базами ходил один хост, а не все.
+#   На стенде хост и так один.
+
+name: vulnscan-e2e
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  # Один MinIO играет две роли: наше внутреннее хранилище и «чужое» хранилище
+  # клиента. Разделение — на уровне бакетов и УЧЁТНЫХ ДАННЫХ, а не адресов:
+  # проверяется именно то, что выгрузка идёт под отдельной учёткой с правами
+  # только на запись.
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      # Наружу — чтобы тест мог читать приёмник. Сам сервис ходит по
+      # внутреннему имени `minio`, как и в бою.
+      - "19000:9000"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # Готовит бакеты и учётку доставки. Отдельным контейнером, а не шагом в
+  # тесте: права выдаёт хранилище, и выдать их должен тот, кто им управляет.
+  provision:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio: {condition: service_healthy}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc mb --ignore-existing local/vulnscan-raw local/vulnscan-clean local/sink
+
+        # Учётка доставки: ТОЛЬКО s3:PutObject и только в свой префикс.
+        # Ровно та политика, что описана в docs/policies.md как обязательная
+        # (M14.4). Если сервису понадобится что-то сверх записи — прогон
+        # упадёт здесь, а не у клиента через месяц.
+        cat > /tmp/write-only.json <<'POLICY'
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Action": ["s3:PutObject"],
+            "Resource": ["arn:aws:s3:::sink/telegram-bot-1/*"]
+          }]
+        }
+        POLICY
+        mc admin user add local dropuser dropuser-secret-32-symbols-long
+        mc admin policy create local write-only /tmp/write-only.json
+        mc admin policy attach local write-only --user dropuser
+        echo "стенд готов"
+
+  clamd:
+    image: clamav/clamav:1.4
+    environment:
+      # Базы обновляются сами: на стенде нет cvdmirror, и брать их неоткуда.
+      CLAMAV_NO_FRESHCLAMD: "false"
+    volumes:
+      # Между прогонами базы переживают: иначе каждый запуск начинался бы с
+      # получасовой закачки, и конвейер перестали бы запускать.
+      - clamav-db:/var/lib/clamav
+    healthcheck:
+      test: ["CMD-SHELL", "clamdscan --ping 1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 40
+      # Первый старт с пустым томом — это закачка баз. Меньше не ставить:
+      # иначе `--wait` объявит стенд сломанным на исправной загрузке.
+      start_period: 300s
+
+  gateway:
+    build:
+      context: ../..
+      dockerfile: services/gateway/Dockerfile
+    environment:
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      POLICY_FILE: /app/config/policies.json
+      KEYS_FILE: /app/config/keys.json
+      REQUIRE_SIGNATURE: "true"
+      # Коротко: тест правит политику и ждёт, пока она подхватится. Тридцать
+      # секунд умолчания превратили бы прогон в ожидание.
+      CONFIG_RELOAD_INTERVAL_S: "2"
+      LOG_FORMAT: json
+    volumes:
+      - ./config:/app/config:ro
+    ports:
+      - "18080:8080"
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      provision: {condition: service_completed_successfully}
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: services/worker/Dockerfile
+    environment:
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      POLICY_FILE: /app/config/policies.json
+      WEIGHTS_FILE: /app/config/weights.json
+      WORK_DIR: /dev/shm/vulnscan
+      CLAMD_HOST: clamd
+      CLAMD_ENABLED: "true"
+      RELOAD_INTERVAL_S: "2"
+      LOG_FORMAT: json
+    volumes:
+      - ./config:/app/config:ro
+    tmpfs:
+      - /dev/shm:size=256m,mode=1777
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      clamd: {condition: service_healthy}
+
+  notifier:
+    build:
+      context: ../..
+      dockerfile: services/notifier/Dockerfile
+    environment:
+      PYTHONPATH: /app
+      REDIS_URL: redis://redis:6379/0
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      KEYS_FILE: /app/config/keys.json
+      # Учётные данные приёмника — в своём каталоге, как в бою: `config`
+      # монтируется и воркеру, а ключ от чужого хранилища ему знать нельзя.
+      DELIVERY_CREDENTIALS_FILE: /app/secrets/delivery.json
+      # Быстрые повторы: тест проверяет, что недоступный приёмник даёт повтор,
+      # а затем dead-letter. С боевыми паузами это заняло бы полчаса.
+      BASE_BACKOFF_S: "1"
+      MAX_BACKOFF_S: "2"
+      MAX_ATTEMPTS: "3"
+      RETRY_POLL_INTERVAL_S: "1"
+      LOG_FORMAT: json
+    volumes:
+      - ./config:/app/config:ro
+      - ./secrets:/app/secrets:ro
+    depends_on:
+      redis: {condition: service_healthy}
+      minio: {condition: service_healthy}
+      provision: {condition: service_completed_successfully}
+
+volumes:
+  # Именованный том, а не каталог в дереве: базы весят сотни мегабайт, и в
+  # рабочем каталоге они попадали бы в контекст сборки образов.
+  clamav-db:

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
@@ -149,6 +150,68 @@ async def list_tenants(
 ) -> dict[str, object]:
     store = _store(request)
     return {"tenants": list(await store.tenants()), "policies": await store.all_policies()}
+
+
+@router.get("/policies/{tenant}")
+async def effective_policy(
+    request: Request, tenant: str, admin: AccessKey = Depends(require_admin)
+) -> dict[str, object]:
+    """Какая политика ДЕЙСТВУЕТ для тенанта прямо сейчас.
+
+    Заведено после того, как настройка доставки трижды подряд не применялась и
+    каждый раз это выяснялось чтением логов: политика, названная по
+    идентификатору ключа; ссылка на несуществующую учётку; блок `delivery`,
+    негодный для старого образа. Все три выглядят одинаково — сервис работает,
+    файлы не приходят.
+
+    Отдаёт не файл, а **разобранное** состояние: то, что видит gateway после
+    загрузки. Файл на диске и действующая политика — разные вещи, и расходятся
+    они молча: тенант без записи получает умолчания, негодный блок `delivery`
+    оставляет пороги в силе и отключает выгрузку.
+
+    Здесь же пример имени объекта. Вопрос «как будут называться мои файлы»
+    иначе проверяется только отправкой файла и походом в бакет.
+    """
+    policy = request.app.state.vs.policies.for_tenant(tenant)
+    known = tenant in {key.tenant for key in request.app.state.vs.keys.all_keys()}
+
+    delivery: dict[str, object] | None = None
+    if policy.delivery is not None:
+        sample = policy.delivery.object_name(
+            scan_id="0" * 32,
+            sha256="0" * 64,
+            verdict="clean",
+            ext=".pdf",
+            when=time.time(),
+            filename="пример",
+        )
+        delivery = {
+            "bucket": policy.delivery.bucket,
+            "prefix": policy.delivery.prefix,
+            "endpoint": policy.delivery.endpoint,
+            "credentials_id": policy.delivery.credentials_id,
+            "key_template": policy.delivery.key_template,
+            # Полный ключ, как он ляжет в бакет, — вместе с префиксом.
+            "пример_ключа": policy.delivery.key_for(sample),
+            # Учётные данные лежат у notifier, и gateway их не видит. Сказать
+            # «ключ на месте» отсюда нельзя — это проверяет `make config-check`.
+            "хранит_имя_файла": policy.delivery.needs_filename,
+        }
+
+    logger.info("запрошена действующая политика", extra={"tenant": tenant, "кем": admin.key_id})
+    return {
+        "tenant": tenant,
+        # Главный вопрос при разборе: применилась запись или взяли умолчания.
+        "своя_политика": policy.tenant == tenant,
+        "есть_ключи": known,
+        "block_threshold": policy.block_threshold,
+        "default_profile": policy.default_profile.value,
+        "deliver_blocked": policy.deliver_blocked,
+        "delivery": delivery,
+        # Пусто — блок либо годен, либо не задан. Непусто — задан и сломан:
+        # выгрузки не будет, а всё остальное работает.
+        "delivery_error": policy.delivery_error,
+    }
 
 
 __all__ = ["MIN_SECRET_LEN", "router"]

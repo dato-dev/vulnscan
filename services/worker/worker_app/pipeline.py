@@ -17,6 +17,7 @@ from vscommon.metrics import metrics
 from vscommon.models import (
     UNSCANNABLE_VERDICTS,
     CachedStructural,
+    CdrProfile,
     SanitizedArtifact,
     ScanJob,
     ScanMode,
@@ -331,7 +332,9 @@ class Pipeline:
             if self._should_sanitize(job, verdict):
                 if on_stage is not None:
                     await on_stage("cdr")
-                await self._sanitize(job, ctx, result, work, sha256, timings)
+                await self._sanitize(
+                    job, ctx, result, work, sha256, timings, self.profile_for(job, verdict)
+                )
 
             result.elapsed_ms = int((time.perf_counter() - started) * 1000)
 
@@ -433,8 +436,28 @@ class Pipeline:
             # а выход проверяется `verify_sanitized`. Без этого теневой режим
             # оставлял бы пользователя без файла ровно в тех случаях, ради
             # которых он и нужен.
-            return job.policy.shadow_mode
+            #
+            # И то же самое, когда тенант попросил отдавать заблокированное
+            # (M14.9). Пересобирается оно ВСЕГДА растеризацией — см.
+            # `profile_for`.
+            return job.policy.shadow_mode or job.policy.deliver_blocked == "strict"
         return True
+
+    @staticmethod
+    def profile_for(job: ScanJob, verdict: Verdict) -> CdrProfile:
+        """Каким профилем пересобирать. Для заблокированного — только `strict`.
+
+        Профиль тенанта здесь не годится. `light` и `standard` удаляют то, что
+        мы **знаем**; для чистого файла этого хватает, для заблокированного
+        нет — мы уже нашли в нём что-то плохое, а платим за ненайденное.
+        Растеризация безопасна by construction: из исходника не остаётся ни
+        одного объекта, и утверждение не зависит от того, что в нём было.
+
+        Поэтому выбор не отдан настройке. Возможность собрать заблокированное
+        профилем `standard` выглядела бы разумным компромиссом и была бы
+        худшим из вариантов: эвристика, выданная за гарантию.
+        """
+        return CdrProfile.STRICT if verdict is Verdict.MALICIOUS else job.profile
 
     async def _sanitize(
         self,
@@ -444,25 +467,26 @@ class Pipeline:
         work: Path,
         sha256: str,
         timings: list[StageTiming],
+        profile: CdrProfile,
     ) -> None:
         out_dir = work / "clean"
         out_dir.mkdir(exist_ok=True)
         started = time.perf_counter()
-        timeout = CDR_TIMEOUT_S[job.profile.value]
+        timeout = CDR_TIMEOUT_S[profile.value]
 
         try:
-            with span("cdr", profile=job.profile.value, timeout_s=timeout):
+            with span("cdr", profile=profile.value, timeout_s=timeout):
                 outcome = await asyncio.wait_for(
-                    asyncio.to_thread(sanitize, ctx.path, out_dir, ctx.detected_mime, job.profile),
+                    asyncio.to_thread(sanitize, ctx.path, out_dir, ctx.detected_mime, profile),
                     timeout=timeout,
                 )
         except (SanitizeError, TimeoutError) as exc:
-            metrics().cdr_seconds.labels(profile=job.profile.value, ok="false").observe(
+            metrics().cdr_seconds.labels(profile=profile.value, ok="false").observe(
                 time.perf_counter() - started
             )
             logger.warning(
                 "CDR не удался",
-                extra={"profile": job.profile.value, "reason": type(exc).__name__},
+                extra={"profile": profile.value, "reason": type(exc).__name__},
             )
             ctx.add("cdr", "CDR_FAILED", type(exc).__name__)
             result.status = ScanStatus.FAILED
@@ -483,14 +507,14 @@ class Pipeline:
 
         result.sanitized = SanitizedArtifact(
             ref=ref,
-            profile=job.profile,
+            profile=profile,
             transforms=outcome.transforms,
             original_sha256=sha256,
             sanitized_sha256=clean_sha,
             expires_at=time.time() + settings.artifact_ttl_s,
         )
         elapsed_s = time.perf_counter() - started
-        metrics().cdr_seconds.labels(profile=job.profile.value, ok="true").observe(elapsed_s)
+        metrics().cdr_seconds.labels(profile=profile.value, ok="true").observe(elapsed_s)
         elapsed = int(elapsed_s * 1000)
         timings.append(StageTiming(stage="cdr", elapsed_ms=elapsed, ok=True))
         logger.debug(

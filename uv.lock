@@ -1509,6 +1509,7 @@ metrics = [
     { name = "prometheus-client" },
 ]
 notifier = [
+    { name = "boto3" },
     { name = "httpx" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -1594,6 +1595,7 @@ gateway = [
 ]
 metrics = [{ name = "prometheus-client", specifier = "==0.26.0" }]
 notifier = [
+    { name = "boto3", specifier = ">=1.35" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pydantic-settings", specifier = ">=2.6" },

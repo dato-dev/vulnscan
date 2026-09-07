@@ -60,6 +60,23 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "packages"))
 
+# Версия проверяется ДО импорта. Иначе `ImportError` из глубины vscommon
+# приписывается отсутствию пакета, и оператор ищет несуществующую проблему:
+# сообщение «не найден пакет vscommon» на старом Python врёт про причину.
+if sys.version_info < (3, 12):  # noqa: UP036 — запускают чем угодно, см. ниже
+    # Версия проверяется ДО импорта. Иначе `ImportError` из глубины vscommon
+    # приписывается отсутствию пакета, и оператор ищет несуществующую проблему:
+    # сообщение «не найден пакет vscommon» на старом Python врёт про причину.
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    sys.stderr.write(
+        f"нужен Python 3.12, запущен {version}.\n"
+        "Скорее всего сработал системный python3. Запускайте окружением репозитория:\n"
+        "  .venv/bin/python deploy/configure.py ...\n"
+        "или через make: make config-check\n"
+        "Окружение создаётся `make venv` (нужен uv).\n"
+    )
+    raise SystemExit(2)
+
 try:
     from vscommon.delivery import DeliveryError, parse_delivery
     from vscommon.keys import MIN_SECRET_LEN, KeyRegistry
@@ -587,6 +604,49 @@ def _check_destination(
     return problems
 
 
+DELIVERY_SECRETS = Path("secrets") / "delivery.json"
+"""Где лежат учётные данные приёмников — рядом с `config`, а не внутри него.
+
+Каталог `config` монтируется в gateway, воркер и deepscan целиком. Ключ доступа
+к чужому хранилищу в нём означал бы, что дыра в парсере даёт запись в
+инфраструктуру клиента, — поэтому секреты живут отдельно и видны только
+notifier.
+"""
+
+
+def _check_credentials(policies: Store) -> list[str]:
+    """Ссылки `credentials_id` из политик разрешаются в файле секретов."""
+    raw = entries(policies.load())
+    wanted = {
+        payload["delivery"]["credentials_id"]: tenant
+        for tenant, payload in raw.items()
+        if isinstance(payload.get("delivery"), dict)
+        and isinstance(payload["delivery"].get("credentials_id"), str)
+    }
+    if not wanted:
+        return []
+
+    path = policies.path.parent.parent / DELIVERY_SECRETS
+    if not path.is_file():
+        example = path.with_name("delivery.example.json")
+        hint = f"; образец рядом: {example}" if example.is_file() else ""
+        return [
+            f"приёмники настроены ({', '.join(sorted(wanted.values()))}), "
+            f"а учётных данных нет: {path} отсутствует{hint}"
+        ]
+
+    try:
+        known = set(entries(json.loads(path.read_text(encoding="utf-8"))))
+    except ValueError as exc:
+        return [f"{path.name}: не разбирается как JSON ({exc})"]
+
+    return [
+        f"{path.name}: нет записи «{name}» — на неё ссылается политика «{tenant}»"
+        for name, tenant in sorted(wanted.items())
+        if name not in known
+    ]
+
+
 def verify_weights(path: Path) -> list[str]:
     if not path.is_file():
         return []
@@ -858,6 +918,25 @@ POLICY_PARAMS: tuple[Param, ...] = (
         "рано или поздно стало бы «отправляем как есть», причём тихо.",
         p_choice(["block", "mark"]),
         default="block",
+    ),
+    Param(
+        "deliver_blocked",
+        "отдавать ли пересобранную копию ЗАБЛОКИРОВАННОГО файла",
+        "never | strict",
+        "never — не отдавать (умолчание). Мы нашли в файле что-то плохое, и "
+        "отдать из него документ значит утверждать, что он теперь безопасен. "
+        "Профили light и standard такого утверждения не выдерживают: они "
+        "удаляют то, что мы ЗНАЕМ, а платим мы за ненайденное.\n"
+        "strict — пересобрать растеризацией и отдать. Здесь утверждение "
+        "держится: из исходника не остаётся ни одного объекта, поэтому оно не "
+        "зависит от того, что в нём было. Цена — теряется текстовый слой, "
+        "документ становится картинками; для договора обычно приемлемо, для "
+        "файла, который дальше разбирают программой, — нет.\n"
+        "Такие копии уезжают в отдельный каталог _rebuilt/ и помечены в "
+        "манифесте: смешивать их с обычными нельзя, скрипт на стороне клиента "
+        "обрабатывает каталог целиком и манифест у каждого файла не читает.",
+        p_choice(["never", "strict"]),
+        default="never",
     ),
     Param(
         "delivery",
@@ -1300,13 +1379,29 @@ def cmd_check(files: Files) -> int:
             continue
         problems.extend(verify(store.path))
 
-    if files.keys.path.is_file():
-        mode = files.keys.path.stat().st_mode & 0o777
+    # Файлы с секретами: у них права строже, чем у остальной конфигурации.
+    # Отдельным списком, а не одной строкой на `keys.json`: следующий такой
+    # файл (учётные данные приёмников из M14) иначе появился бы без проверки —
+    # и заметить это можно было бы только по чужому доступу к бакету.
+    secret_files = [
+        (files.keys.path, "секреты подписи"),
+        (files.keys.path.parent.parent / "secrets" / "delivery.json", "ключи к чужим хранилищам"),
+    ]
+    for path, what in secret_files:
+        if not path.is_file():
+            continue
+        mode = path.stat().st_mode & 0o777
         if mode & 0o077:
             problems.append(
-                f"keys.json доступен не только владельцу (права {mode:04o}): "
-                f"в нём секреты подписи, нужно 0600"
+                f"{path.name} доступен не только владельцу (права {mode:04o}): "
+                f"в нём {what}, нужно 0600"
             )
+
+    # Приёмник настроен, а учёток к нему нет — доставки не будет ни одной, и
+    # узнать об этом можно только по пустому ящику у клиента. Ссылка
+    # `credentials_id` из политики проверяется здесь, до выката, а не в бою по
+    # записям dead-letter.
+    problems.extend(_check_credentials(files.policies))
 
     keys_data = entries(files.keys.load())
     policy_data = entries(files.policies.load())
@@ -1314,11 +1409,38 @@ def cmd_check(files: Files) -> int:
 
     with_keys = {entry.get("tenant") for entry in keys_data.values()}
     for tenant in sorted(set(policy_data) - with_keys):
-        # Не ошибка: тенант может ещё не получить ключ. Но чаще это опечатка в
-        # имени, а выглядит она как «политику настроили, а она не применяется».
+        # Частный случай, и он не «может быть»: имя политики совпало с
+        # ИДЕНТИФИКАТОРОМ КЛЮЧА, у которого другой тенант. `policies.json`
+        # ключуется по тенанту, поэтому такая запись не применится никогда.
+        #
+        # Отдельной строкой, потому что путаница естественная: в `.env` лежит
+        # `KEY_ID=telegram-bot-1`, он же встречается в логах и в заголовке
+        # запроса, а тенант виден только внутри `keys.json`. Ошибка при этом
+        # молчит: сервис работает, вердикты выдаёт, настройка не действует.
+        owner = keys_data.get(tenant, {}).get("tenant")
+        if owner:
+            problems.append(
+                f"политика «{tenant}» названа по идентификатору ключа, а не по тенанту: "
+                f"этот ключ принадлежит тенанту «{owner}». Переименуйте запись в «{owner}» — "
+                f"иначе она не применится никогда"
+            )
+            continue
+        # Общий случай: тенант может ещё не получить ключ. Но чаще это опечатка
+        # в имени, а выглядит она как «политику настроили, а она не работает».
         notes.append(f"политика «{tenant}» настроена, но ключей этого тенанта нет")
     for tenant in sorted(with_keys - set(policy_data) - {None}):
         notes.append(f"тенант «{tenant}» работает на умолчаниях: своей политики нет")
+
+    for tenant, payload in sorted(policy_data.items()):
+        template = (payload.get("delivery") or {}).get("key_template", "")
+        if template and not any(token in template for token in ("{scan_id}", "{sha}")):
+            # Не ошибка: в бакете может быть включено версионирование, и тогда
+            # перезапись не теряет документ. Но по умолчанию теряет — молча, и
+            # обнаруживается это, когда файл ищут и не находят.
+            notes.append(
+                f"приёмник «{tenant}»: в key_template нет ни {{scan_id}}, ни {{sha}} — "
+                f"два документа с одинаковым именем затрут друг друга"
+            )
 
     unknown = {
         code

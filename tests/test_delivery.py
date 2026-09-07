@@ -30,6 +30,7 @@ from vscommon.models import (
     Finding,
     ObjectRef,
     SanitizedArtifact,
+    ScanJob,
     ScanResult,
     ScanStatus,
     Severity,
@@ -60,6 +61,19 @@ def _result(verdict: Verdict = Verdict.CLEAN, sanitized: bool = True) -> ScanRes
         )
         if sanitized
         else None,
+    )
+
+
+def _job(deliver_blocked: str = "never", profile: CdrProfile = CdrProfile.STANDARD) -> ScanJob:
+    from vscommon.models import ScanJob
+
+    return ScanJob(
+        scan_id="s1",
+        sha256=SHA,
+        source=ObjectRef(bucket="b", key="k"),
+        size=1,
+        profile=profile,
+        policy=TenantPolicy(deliver_blocked=deliver_blocked),
     )
 
 
@@ -272,20 +286,64 @@ def test_worker_does_not_upload_anything_itself() -> None:
     assert not offenders, f"воркер сам ходит в чужое хранилище: {offenders}"
 
 
-def test_original_filename_never_reaches_the_destination() -> None:
-    """Имя объекта строится из `scan_id`, а не из имени файла.
+def test_filename_is_not_carried_unless_asked() -> None:
+    """По умолчанию имя файла до воркера не доезжает.
 
-    Имена файлов часто содержат персональные данные, и мы их не храним —
-    только расширение. Сопоставить объект с обращением клиент может по
-    `scan_id` из манифеста.
+    Задание лежит в Redis, а Redis пишет на диск. Имена документов часто
+    содержат ФИО и номера, поэтому gateway оставляет от имени расширение и
+    выбрасывает остальное. Хранение включается только явной просьбой
+    `{filename}` в шаблоне: включённое «на всякий случай», оно остаётся
+    навсегда.
     """
-    import inspect
+    from vscommon.delivery import parse_delivery
 
-    from worker_app.main import Worker
+    plain = parse_delivery({"bucket": "b", "credentials_id": "c"})
+    asking = parse_delivery(
+        {"bucket": "b", "credentials_id": "c", "key_template": "{filename}{ext}"}
+    )
 
-    source = inspect.getsource(Worker._enqueue_delivery)
+    assert not plain.needs_filename
+    assert asking.needs_filename
 
-    assert "result.scan_id}{job.filename_ext" in source
+    source = (
+        Path("services/gateway/gateway_app/ingest.py").read_text().split("filename_ext=ext,")[1]
+    )
+    assert "needs_filename" in source[:400], "gateway несёт имя, не спросив приёмник"
+
+
+def test_the_name_from_the_user_is_sanitised() -> None:
+    """Имя файла — единственное значение в ключе, пришедшее от пользователя.
+
+    Остальные порождены нами: идентификаторы, хэши, вердикты, даты. Это —
+    недоверенный ввод, и в ключе объекта он опаснее обычного: ящик забирают
+    через `aws s3 sync`, где ключ становится именем файла на чужом диске.
+    """
+    from vscommon.delivery import parse_delivery
+
+    delivery = parse_delivery(
+        {"bucket": "b", "credentials_id": "c", "key_template": "{filename}{ext}"}
+    )
+
+    escaped = delivery.object_name("s1", "a" * 64, "clean", ".pdf", 0.0, "../../etc/passwd")
+    control = delivery.object_name("s1", "a" * 64, "clean", ".pdf", 0.0, "имя\nс переводом")
+
+    assert "/" not in escaped and ".." not in escaped
+    assert "\n" not in control
+
+
+def test_an_unusable_name_falls_back_to_the_scan_id() -> None:
+    """Пустой сегмент в ключе отвергается — доставка встала бы на одном файле.
+
+    Имя вроде `...` или `///` после обезвреживания не оставляет ничего.
+    Запасное значение — `scan_id`: он уникален и всегда есть.
+    """
+    from vscommon.delivery import parse_delivery
+
+    delivery = parse_delivery(
+        {"bucket": "b", "credentials_id": "c", "key_template": "{filename}{ext}"}
+    )
+
+    assert delivery.object_name("s1", "a" * 64, "clean", ".pdf", 0.0, "...") == "s1.pdf"
 
 
 # --- отказ доставки виден --------------------------------------------------
@@ -585,3 +643,102 @@ async def test_failed_upload_is_retried_not_swallowed(error: Exception) -> None:
 
     assert not notifier.put
     assert len(notifier.retried) == 1
+
+
+# --- пересборка заблокированного (M14.9) -----------------------------------
+
+
+def test_blocked_is_not_rebuilt_by_default() -> None:
+    """Умолчание — не пересобирать.
+
+    Мы нашли в файле что-то плохое; отдать из него документ значит утверждать,
+    что он теперь безопасен. Такое утверждение надо включать осознанно.
+    """
+    from worker_app.pipeline import Pipeline
+
+    job = _job(deliver_blocked="never")
+
+    assert not Pipeline._should_sanitize(job, Verdict.MALICIOUS)
+
+
+def test_blocked_is_rebuilt_when_asked() -> None:
+    from worker_app.pipeline import Pipeline
+
+    assert Pipeline._should_sanitize(_job(deliver_blocked="strict"), Verdict.MALICIOUS)
+
+
+def test_blocked_is_always_rebuilt_by_rasterisation() -> None:
+    """Профиль тенанта для заблокированного не годится.
+
+    `light` и `standard` удаляют то, что мы **знаем**; для чистого файла этого
+    хватает, для заблокированного нет — мы уже нашли в нём вредоносное, а
+    платим за ненайденное. Растеризация безопасна by construction.
+    """
+    from worker_app.pipeline import Pipeline
+
+    job = _job(deliver_blocked="strict", profile=CdrProfile.LIGHT)
+
+    assert Pipeline.profile_for(job, Verdict.MALICIOUS) is CdrProfile.STRICT
+    assert Pipeline.profile_for(job, Verdict.CLEAN) is CdrProfile.LIGHT
+
+
+def test_no_middle_ground_in_the_policy() -> None:
+    """`standard` для заблокированного выглядел бы компромиссом.
+
+    И был бы худшим вариантом: эвристика, выданная за гарантию. Поэтому
+    значений всего два.
+    """
+    from typing import get_args
+
+    field = TenantPolicy.model_fields["deliver_blocked"]
+
+    assert set(get_args(field.annotation)) == {"never", "strict"}
+
+
+def test_deep_rebuild_does_not_leak_to_the_client() -> None:
+    """Углублённая проверка пересобирает заблокированное и без доставки.
+
+    Она выясняет, поддаётся ли документ безопасной пересборке вообще. Артефакт
+    при этом существует — и уехал бы клиенту как обычная копия, если бы
+    доставка смотрела только на `result.sanitized is not None`.
+    """
+    import inspect
+
+    from worker_app.main import Worker
+
+    source = inspect.getsource(Worker._enqueue_delivery)
+
+    assert 'policy.deliver_blocked == "strict"' in source
+    assert "result.sanitized.ref if (result.sanitized and allowed)" in source
+
+
+def test_rebuilt_copies_live_in_their_own_directory() -> None:
+    """Разделение не должно зависеть от шаблона имени.
+
+    Скрипт на стороне клиента обрабатывает каталог целиком и манифест у
+    каждого файла не читает. В общем каталоге пересобранное из
+    заблокированного было бы принято за обычную копию.
+    """
+    from vscommon.delivery import REBUILT_PREFIX, TOKENS
+
+    assert REBUILT_PREFIX
+    assert "rebuilt" not in TOKENS, "каталог задан константой, а не настройкой шаблона"
+
+    source = NOTIFIER.read_text()
+    assert "REBUILT_PREFIX + task.name" in source
+
+
+def test_manifest_marks_a_rebuilt_copy() -> None:
+    """Поле отдельное, а не вывод из вердикта.
+
+    `malicious` бывает и без копии — тогда это отказ. Здесь утверждение
+    обратное: файл рядом есть, и он получен растеризацией заблокированного.
+    """
+    payload = _result(Verdict.MALICIOUS, sanitized=True).model_dump_json()
+
+    rebuilt = manifest_for(payload, "doc.pdf", delivered=True, rebuilt_from_blocked=True)
+    refused = manifest_for(payload, "doc.pdf", delivered=False)
+
+    assert rebuilt["rebuilt_from_blocked"] is True
+    assert rebuilt["verdict"] == "malicious", "вердикт не смягчается пересборкой"
+    assert refused["rebuilt_from_blocked"] is False

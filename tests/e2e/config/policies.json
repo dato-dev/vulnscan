@@ -1,0 +1,18 @@
+{
+  "telegram-bot": {
+    "fail_mode": "suspicious",
+    "block_threshold": 80,
+    "suspicious_threshold": 30,
+    "default_profile": "standard",
+    "deliver_blocked": "strict",
+    "delivery": {
+      "backend": "s3",
+      "endpoint": "http://minio:9000",
+      "bucket": "sink",
+      "prefix": "telegram-bot-1/",
+      "region": "us-east-1",
+      "credentials_id": "telegram-bot-1",
+      "key_template": "{filename}-Проверено-{verdict}-{sha}{ext}"
+    }
+  }
+}

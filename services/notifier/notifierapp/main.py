@@ -33,7 +33,7 @@ from vscommon.storage import build_store
 from vscommon.telemetry import continue_trace, setup_tracing, shutdown_tracing
 
 from .config import settings
-from .dropoff import Dropoff, DropoffError, manifest_for
+from .dropoff import REBUILT_PREFIX, Dropoff, DropoffError, manifest_for
 from .sender import CallbackSender
 
 logger = logging.getLogger(__name__)
@@ -232,14 +232,24 @@ class Notifier:
         пустоту.
         """
         dropoff = Dropoff(task.destination, credentials)
+        # Пересобранное из заблокированного — в свой каталог, вместе с
+        # манифестом. Иначе оно легло бы рядом с обычными копиями и было бы
+        # обработано как обычная.
+        name = (REBUILT_PREFIX + task.name) if task.rebuilt_from_blocked else task.name
 
         if task.artifact is not None:
             with tempfile.TemporaryDirectory(prefix="vsdrop-") as tmp:
-                local = self._store.get_to_path(task.artifact, Path(tmp) / task.name)
-                dropoff.put_file(task.artifact, local, task.name)
+                local = self._store.get_to_path(task.artifact, Path(tmp) / "copy")
+                dropoff.put_file(task.artifact, local, name)
 
         dropoff.put_manifest(
-            task.name, manifest_for(task.payload, task.name, task.artifact is not None)
+            name,
+            manifest_for(
+                task.payload,
+                name,
+                delivered=task.artifact is not None,
+                rebuilt_from_blocked=task.rebuilt_from_blocked,
+            ),
         )
 
     async def _retry_delivery(self, task: DeliveryTask, detail: str) -> None:

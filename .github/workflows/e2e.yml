@@ -1,0 +1,194 @@
+# Сквозной прогон доставки (ROADMAP M13.0).
+#
+# Зачем. Путь «файл принят → проверен → пересобран → выгружен в чужое
+# хранилище» ни разу не выполнялся целиком: в обычных тестах `boto3` подменён,
+# и заглушка проверяет наши представления о нём, а не работу. За неделю на этом
+# пути нашлись подряд отсутствующая зависимость в образе, политика с неверным
+# именем, ссылка на несуществующую учётку и поле, которого нет в выкаченном
+# образе. Симптом каждый раз был один: сервис работает, файлы не приходят.
+#
+# Почему на своём раннере. Прогон поднимает пять контейнеров и собирает образы
+# из дерева — на раннерах GitHub это минуты и мегабайты на каждый запуск. Плюс
+# сборка тянет `ghcr.io` и Docker Hub, а на своём раннере кэш слоёв между
+# прогонами живёт.
+#
+# ВАЖНО, про self-hosted. У этого конвейера нет и не должно быть триггера
+# `pull_request`: на своём раннере он означал бы выполнение кода из чужого
+# форка на вашем железе. `pull_request_target` — то же самое, но хуже. Только
+# push в основную ветку, расписание и ручной запуск — всё с кодом из ветки.
+
+name: e2e
+
+on:
+  push:
+    branches: [main]
+    # Пути, правка которых способна сломать доставку. Не весь репозиторий:
+    # прогон долгий, и запускать его на правку README значит приучить всех
+    # его игнорировать.
+    paths:
+      - "packages/vscommon/**"
+      - "services/**"
+      - "tests/e2e/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/e2e.yml"
+
+  schedule:
+    # Раз в сутки. Прогон ловит не только свои изменения: базовые образы,
+    # MinIO и зависимости меняются сами, и отказ от этого выглядит так же —
+    # файлы перестают приходить.
+    - cron: "0 4 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Стенд занимает фиксированные порты (18080, 19000). Два прогона одновременно
+# подрались бы за них, и второй падал бы на «port is already allocated» —
+# отказ, не имеющий отношения к проверяемому коду.
+concurrency:
+  group: e2e
+  cancel-in-progress: false
+
+jobs:
+  delivery:
+    # ЗАМЕНИТЕ на метки своего раннера, как в security.yml.
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Раннер свой и живёт долго: без этого токен останется лежать в
+          # .git/config рабочего каталога до следующего запуска.
+          persist-credentials: false
+
+      - name: Поставить uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          # Та же версия, что в остальных конвейерах и в Dockerfile.
+          version: "0.11.25"
+
+      - name: Окружение
+        # Из того же лока, что и образы. Тесту нужны pytest и boto3 — вторым
+        # он читает приёмник, но уже АДМИНСКОЙ учёткой: у сервиса своя, с
+        # правами только на запись, и подменять одну другой нельзя.
+        run: uv sync --frozen --all-groups
+
+      - name: Поднять стенд
+        # `--build` обязателен: прогон по опубликованному тегу воспроизводил
+        # бы расхождение кода и образа вместе с ошибкой, а половина найденного
+        # была именно им.
+        run: docker compose -f tests/e2e/docker-compose.yml up -d --build --wait
+
+      - name: Сэмплы
+        run: .venv/bin/python samples/make_samples.py
+
+      - name: Прогон
+        run: .venv/bin/python -m pytest tests/e2e -v -p no:cacheprovider
+
+      - name: Логи стенда при сбое
+        # Ради разбора: падение сквозного теста почти никогда не объясняется
+        # самим тестом — причина в логах одного из пяти контейнеров.
+        if: failure()
+        run: docker compose -f tests/e2e/docker-compose.yml logs --tail 200
+
+      - name: Погасить стенд
+        # Всегда, включая отмену прогона: контейнеры переживают задачу и
+        # достанутся следующей, а порты останутся занятыми.
+        #
+        # Тома НЕ сносим (`down` без `-v`): в `clamav-db` лежат антивирусные
+        # базы, и удаление превращало бы каждый прогон в получасовую закачку.
+        if: always()
+        run: docker compose -f tests/e2e/docker-compose.yml down
+
+  # Отдельная задача, а не шаг предыдущей. MinIO проверяет нашу логику,
+  # настоящий Yandex Object Storage — совместимость: подпись, регион,
+  # поведение при отказе в правах. Разделены потому, что причины отказа разные:
+  # красная задача `delivery` означает «сломан код», красная `yandex` —
+  # «сломан код ИЛИ внешний сервис недоступен». Слив их в одну, мы получили бы
+  # сборку, красноту которой объясняют погодой.
+  yandex:
+    # Только по расписанию и вручную: на каждый push ходить во внешнее
+    # хранилище незачем, а флапающая проверка приучает игнорировать красное.
+    if: github.event_name != 'push'
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Проверить, что приёмник настроен
+        # Без секретов задача не падает, а сообщает, чего не хватает. Красный
+        # прогон из-за незаполненного секрета читался бы как поломка сервиса.
+        id: ready
+        env:
+          BUCKET: ${{ vars.E2E_SINK_BUCKET }}
+          ACCESS: ${{ secrets.E2E_SINK_ACCESS_KEY }}
+        run: |
+          set -eu
+          if [ -z "${BUCKET:-}" ] || [ -z "${ACCESS:-}" ]; then
+            echo "::notice::прогон против Yandex пропущен: не заданы vars.E2E_SINK_BUCKET и secrets.E2E_SINK_*"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Поставить uv
+        if: steps.ready.outputs.ready == 'true'
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.11.25"
+
+      - name: Окружение
+        if: steps.ready.outputs.ready == 'true'
+        run: uv sync --frozen --all-groups
+
+      - name: Настроить приёмник
+        if: steps.ready.outputs.ready == 'true'
+        env:
+          E2E_SINK_ENDPOINT: https://storage.yandexcloud.net
+          E2E_SINK_BUCKET: ${{ vars.E2E_SINK_BUCKET }}
+          E2E_SINK_REGION: ru-central1
+          E2E_SINK_ACCESS_KEY: ${{ secrets.E2E_SINK_ACCESS_KEY }}
+          E2E_SINK_SECRET_KEY: ${{ secrets.E2E_SINK_SECRET_KEY }}
+          # Свой префикс на прогон. Учётка сервиса умеет только писать и за
+          # собой не убирает — уборку в бакете делает правило жизненного цикла,
+          # а не тест. Без разделения прогоны видели бы объекты друг друга и
+          # проходили по чужим файлам.
+          E2E_SINK_PREFIX: e2e/${{ github.run_id }}/
+        run: .venv/bin/python tests/e2e/configure_sink.py
+
+      - name: Поднять стенд
+        if: steps.ready.outputs.ready == 'true'
+        run: docker compose -f tests/e2e/docker-compose.yml up -d --build --wait
+
+      - name: Сэмплы
+        if: steps.ready.outputs.ready == 'true'
+        run: .venv/bin/python samples/make_samples.py
+
+      - name: Прогон
+        if: steps.ready.outputs.ready == 'true'
+        env:
+          E2E_SINK_ENDPOINT: https://storage.yandexcloud.net
+          E2E_SINK_BUCKET: ${{ vars.E2E_SINK_BUCKET }}
+          E2E_SINK_REGION: ru-central1
+          E2E_SINK_PREFIX: e2e/${{ github.run_id }}/
+          E2E_SINK_ACCESS_KEY: ${{ secrets.E2E_SINK_ACCESS_KEY }}
+          E2E_SINK_SECRET_KEY: ${{ secrets.E2E_SINK_SECRET_KEY }}
+          # Читает приёмник ОТДЕЛЬНАЯ учётка: у сервиса права только на запись,
+          # и подменять их админскими значило бы проверять не то, что поедет.
+          E2E_READER_ACCESS_KEY: ${{ secrets.E2E_SINK_ACCESS_KEY }}
+          E2E_READER_SECRET_KEY: ${{ secrets.E2E_SINK_SECRET_KEY }}
+        run: .venv/bin/python -m pytest tests/e2e -v -p no:cacheprovider
+
+      - name: Логи стенда при сбое
+        if: failure()
+        run: docker compose -f tests/e2e/docker-compose.yml logs --tail 200
+
+      - name: Погасить стенд
+        if: always()
+        run: docker compose -f tests/e2e/docker-compose.yml down

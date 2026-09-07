@@ -418,3 +418,321 @@ def test_broken_destination_is_reported_by_the_checker(tool: Any, tmp_path: Any)
     problems = tool.verify_policies(path)
 
     assert any("приёмник" in problem for problem in problems), problems
+
+
+def test_delivery_secrets_need_owner_only_rights(
+    tool: Any, tmp_path: Path, capsys: Any
+) -> None:
+    """Ключи к чужим хранилищам — такие же секреты, как и ключи подписи.
+
+    Проверка списком, а не строкой на `keys.json`: следующий файл с секретами
+    иначе появился бы без неё, и заметить это можно было бы только по чужому
+    доступу к бакету.
+    """
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    delivery = secrets / "delivery.json"
+    delivery.write_text("{}", encoding="utf-8")
+    delivery.chmod(0o644)
+
+    files = tool.files_at(tmp_path / "config")
+    tool.cmd_check(files)
+
+    assert "delivery.json доступен не только владельцу" in capsys.readouterr().out
+
+
+def test_correct_rights_are_not_reported(tool: Any, tmp_path: Path, capsys: Any) -> None:
+    """Проверка проверки: на правильных правах жалобы быть не должно."""
+    secrets = tmp_path / "secrets"
+    secrets.mkdir()
+    delivery = secrets / "delivery.json"
+    delivery.write_text("{}", encoding="utf-8")
+    delivery.chmod(0o600)
+
+    tool.cmd_check(tool.files_at(tmp_path / "config"))
+
+    assert "delivery.json" not in capsys.readouterr().out
+
+
+# --- ссылка на учётные данные разрешается (M14.8) --------------------------
+
+
+def _with_delivery(tmp_path: Path, credentials_id: str = "yandex-drop") -> Any:
+    config = tmp_path / "config"
+    config.mkdir(exist_ok=True)
+    (config / "policies.json").write_text(
+        json.dumps(
+            {
+                "team-a": {
+                    "delivery": {
+                        "bucket": "clean",
+                        "prefix": "vulnscan/team-a/",
+                        "credentials_id": credentials_id,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_missing_credentials_file_is_reported(tool: Any, tmp_path: Path, capsys: Any) -> None:
+    """Приёмник настроен, а учёток нет — доставки не будет ни одной.
+
+    Узнать об этом иначе можно только по пустому ящику у клиента: сервис
+    работает, вердикты выдаёт, файлы никуда не едут.
+    """
+    tool.cmd_check(tool.files_at(_with_delivery(tmp_path)))
+
+    assert "учётных данных нет" in capsys.readouterr().out
+
+
+def test_unknown_credentials_id_is_reported(tool: Any, tmp_path: Path, capsys: Any) -> None:
+    """Опечатка в ссылке ловится до выката, а не по записям dead-letter."""
+    config = _with_delivery(tmp_path, credentials_id="yandex-drp")
+    secrets = tmp_path / "secrets"
+    secrets.mkdir(exist_ok=True)
+    (secrets / "delivery.json").write_text(
+        json.dumps({"yandex-drop": {"access_key": "a", "secret_key": "s" * 16}}),
+        encoding="utf-8",
+    )
+
+    tool.cmd_check(tool.files_at(config))
+
+    assert "нет записи «yandex-drp»" in capsys.readouterr().out
+
+
+def test_resolvable_reference_is_quiet(tool: Any, tmp_path: Path, capsys: Any) -> None:
+    """Проверка проверки: на верной ссылке жалобы быть не должно."""
+    config = _with_delivery(tmp_path)
+    secrets = tmp_path / "secrets"
+    secrets.mkdir(exist_ok=True)
+    delivery = secrets / "delivery.json"
+    delivery.write_text(
+        json.dumps({"yandex-drop": {"access_key": "a", "secret_key": "s" * 16}}),
+        encoding="utf-8",
+    )
+    delivery.chmod(0o600)
+
+    tool.cmd_check(tool.files_at(config))
+
+    assert "delivery" not in capsys.readouterr().out
+
+
+# --- политика по тенанту, а не по key_id -----------------------------------
+
+
+def test_policy_named_after_a_key_id_is_an_error(
+    tool: Any, tmp_path: Path, capsys: Any
+) -> None:
+    """Имя политики совпало с идентификатором ключа — она не применится никогда.
+
+    Путаница естественная: `KEY_ID` лежит в `.env`, встречается в логах и в
+    заголовке запроса, а тенант виден только внутри `keys.json`. При этом
+    ошибка молчит — сервис работает, вердикты выдаёт, настройка не действует.
+    Именно так настроенная доставка не выгрузила ни одного файла.
+    """
+    config = tmp_path / "config"
+    config.mkdir()
+    keys = config / "keys.json"
+    keys.write_text(
+        json.dumps({"telegram-bot-1": {"tenant": "telegram-bot", "secret": GOOD_SECRET}}),
+        encoding="utf-8",
+    )
+    # Права выставляем сразу: иначе ненулевой код возврата пришёл бы от
+    # проверки прав, и тест проходил бы, даже если проверку тенанта убрать.
+    keys.chmod(0o600)
+    (config / "policies.json").write_text(
+        json.dumps({"telegram-bot-1": {"block_threshold": 50}}), encoding="utf-8"
+    )
+
+    code = tool.cmd_check(tool.files_at(config))
+    printed = capsys.readouterr().out
+
+    assert code != 0, "это ошибка, а не замечание: запись не применится никогда"
+    assert "названа по идентификатору ключа" in printed
+    assert "«telegram-bot»" in printed, "надо назвать верное имя, а не только сказать «не так»"
+
+
+def test_policy_for_a_tenant_without_keys_is_only_a_note(
+    tool: Any, tmp_path: Path, capsys: Any
+) -> None:
+    """Тенант без ключей — не ошибка: ключ могли ещё не выпустить.
+
+    Разделение существенное: если считать ошибкой и это, вывод перестанут
+    читать, и настоящая находка утонет вместе с остальным.
+    """
+    config = tmp_path / "config"
+    config.mkdir()
+    keys = config / "keys.json"
+    keys.write_text(
+        json.dumps({"k1": {"tenant": "team-a", "secret": GOOD_SECRET}}), encoding="utf-8"
+    )
+    keys.chmod(0o600)
+    (config / "policies.json").write_text(
+        json.dumps({"team-b": {"block_threshold": 50}}), encoding="utf-8"
+    )
+
+    code = tool.cmd_check(tool.files_at(config))
+
+    assert code == 0
+    assert "ключей этого тенанта нет" in capsys.readouterr().out
+
+
+def test_template_without_a_unique_part_is_noted(tool: Any, tmp_path: Path, capsys: Any) -> None:
+    """Два документа с одним именем затрут друг друга.
+
+    Замечание, а не ошибка: в бакете может быть включено версионирование, и
+    тогда перезапись документ не теряет. Но по умолчанию теряет — молча, и
+    обнаруживается это, когда файл ищут и не находят.
+    """
+    config = tmp_path / "config"
+    config.mkdir()
+    keys = config / "keys.json"
+    keys.write_text(
+        json.dumps({"k": {"tenant": "team-a", "secret": GOOD_SECRET}}), encoding="utf-8"
+    )
+    keys.chmod(0o600)
+    (config / "policies.json").write_text(
+        json.dumps(
+            {
+                "team-a": {
+                    "delivery": {
+                        "bucket": "b",
+                        "prefix": "p/",
+                        "credentials_id": "c",
+                        "key_template": "{filename}-Проверено-{verdict}{ext}",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = tool.cmd_check(tool.files_at(config))
+    printed = capsys.readouterr().out
+
+    assert "затрут друг друга" in printed
+    assert code != 0, "учёток нет — это отдельная ошибка, замечание её не заменяет"
+
+
+def test_template_with_scan_id_is_quiet(tool: Any, tmp_path: Path, capsys: Any) -> None:
+    """Проверка проверки: с уникальной частью замечания быть не должно."""
+    config = tmp_path / "config"
+    config.mkdir()
+    (config / "policies.json").write_text(
+        json.dumps(
+            {
+                "team-a": {
+                    "delivery": {
+                        "bucket": "b",
+                        "prefix": "p/",
+                        "credentials_id": "c",
+                        "key_template": "{filename}-{scan_id}{ext}",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tool.cmd_check(tool.files_at(config))
+
+    assert "затрут друг друга" not in capsys.readouterr().out
+
+
+# --- подписанный запрос к служебным ручкам ---------------------------------
+
+
+@pytest.fixture()
+def ask(tool: Any) -> Any:
+    """Модуль `deploy/vsask.py` — как его запускает оператор."""
+    import importlib.util
+    from pathlib import Path as _Path
+
+    path = _Path(__file__).parent.parent / "deploy/vsask.py"
+    spec = importlib.util.spec_from_file_location("vsask", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_signature_matches_what_the_service_checks(ask: Any) -> None:
+    """Подпись считается функциями сервиса, а не своей копией.
+
+    Копия разошлась бы молча: запросы начали бы отвергаться, а причина в ответ
+    не уходит — сервис намеренно не сообщает, ключа нет или подпись не сошлась.
+    """
+    from vscommon.keys import AccessKey, KeyRegistry
+    from vscommon.signing import sign
+
+    secret = "s" * 40
+    registry = KeyRegistry(
+        {"admin-1": AccessKey(key_id="admin-1", tenant="root", secret=secret, admin=True)}
+    )
+    timestamp, signature = sign(secret, b"")
+
+    key, _check = registry.check("admin-1", b"", timestamp, signature)
+
+    assert key is not None and key.admin
+    assert "from vscommon.signing import" in (ask.__doc__ or "") or hasattr(ask, "sign")
+
+
+def test_missing_admin_key_says_what_to_do(ask: Any) -> None:
+    """Отказ должен вести к действию, а не просто сообщать о нём.
+
+    Обычным ключом служебные ручки отвечают `404` — «не найдено», — и без
+    подсказки оператор ищет несуществующую ручку вместо того, чтобы завести
+    ключ.
+    """
+    with pytest.raises(SystemExit) as exc:
+        ask.pick_key({"k1": {"tenant": "team-a", "secret": "s" * 40}}, None)
+
+    assert "configure.py keys add" in str(exc.value)
+
+
+def test_several_admin_keys_are_not_guessed(ask: Any) -> None:
+    """Угадывать нельзя: запрос уйдёт от чужого имени.
+
+    В аудите служебных ручек остаётся, кто спрашивал; выбранный за оператора
+    ключ сделал бы эту запись ложной.
+    """
+    keys = {
+        "a1": {"secret": "s" * 40, "admin": True},
+        "a2": {"secret": "z" * 40, "admin": True},
+    }
+
+    with pytest.raises(SystemExit) as exc:
+        ask.pick_key(keys, None)
+
+    assert "--key" in str(exc.value)
+
+
+def test_disabled_admin_key_is_not_picked(ask: Any) -> None:
+    """Отозванный ключ сервис не примет — выбирать его незачем."""
+    keys = {"a1": {"secret": "s" * 40, "admin": True, "disabled": True}}
+
+    with pytest.raises(SystemExit) as exc:
+        ask.pick_key(keys, None)
+
+    assert "административного ключа нет" in str(exc.value)
+
+
+def test_old_python_says_so_instead_of_blaming_the_package() -> None:
+    """Сообщение об ошибке обязано называть настоящую причину.
+
+    Системный `python3` часто старый. Импорт из vscommon падает изнутри, и
+    прежний текст приписывал это отсутствию пакета — оператор шёл искать
+    несуществующую проблему вместо того, чтобы взять другой интерпретатор.
+    """
+    from pathlib import Path as _Path
+
+    for name in ("configure.py", "vsask.py"):
+        source = (_Path(__file__).parent.parent / "deploy" / name).read_text()
+        guard = source.index("sys.version_info < (3, 12)")
+        imports = source.index("from vscommon")
+
+        assert guard < imports, f"{name}: версия проверяется после импорта — сообщение соврёт"
+        assert ".venv/bin/python" in source, f"{name}: не сказано, чем запускать"

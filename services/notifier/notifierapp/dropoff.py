@@ -24,10 +24,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from vscommon.delivery import Delivery, DeliveryCredentials
+from vscommon.delivery import REBUILT_PREFIX, Delivery, DeliveryCredentials
 from vscommon.models import ObjectRef
 
 logger = logging.getLogger(__name__)
+
+__all__ = ["REBUILT_PREFIX", "Dropoff", "DropoffError", "manifest_for"]
 
 MANIFEST_SUFFIX = ".vulnscan.json"
 """Манифест лежит рядом с файлом и назван по нему.
@@ -57,7 +59,9 @@ class DropoffError(Exception):
     """Выгрузка не удалась. Повтор решает вызывающий."""
 
 
-def manifest_for(payload: str, task_name: str, delivered: bool) -> dict[str, Any]:
+def manifest_for(
+    payload: str, task_name: str, delivered: bool, rebuilt_from_blocked: bool = False
+) -> dict[str, Any]:
     """Что положить рядом с файлом. Содержимого документа здесь нет.
 
     `delivered` отвечает на главный вопрос ящика: файл рядом есть или его не
@@ -77,6 +81,10 @@ def manifest_for(payload: str, task_name: str, delivered: bool) -> dict[str, Any
         "scan_id": result.get("scan_id", ""),
         "object": task_name if delivered else None,
         "delivered": delivered,
+        # Отдельным полем, а не выводом из `verdict`: вердикт `malicious`
+        # бывает и без копии — тогда это отказ. Здесь утверждение обратное:
+        # файл рядом есть, и он получен растеризацией заблокированного.
+        "rebuilt_from_blocked": rebuilt_from_blocked,
         "verdict": result.get("verdict", "unknown"),
         "status": result.get("status", ""),
         "score": result.get("score", 0),

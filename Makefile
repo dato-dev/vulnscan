@@ -1,4 +1,4 @@
-.PHONY: help venv lock up down logs test test-integration lint fmt typecheck samples smoke \
+.PHONY: help venv lock up down logs test test-integration test-e2e lint fmt typecheck samples smoke \
         corpus corpus-check rules-check findings-doc buildx-setup images push release \
         config config-check check-stack
 
@@ -123,6 +123,18 @@ corpus:  ## Скачать корпус реальных PDF (см. corpus/READM
 
 corpus-check:  ## Регрессия на ложные срабатывания по корпусу
 	$(PY) corpus/check.py $(if $(API),--api $(API),)
+
+test-e2e:  ## Сквозной прогон доставки: поднимает стек и гоняет по нему файлы
+	# Первый запуск долгий: clamd тянет антивирусные базы. Том переживает
+	# прогоны, дальше быстро.
+	$(PY) tests/e2e/configure_sink.py
+	docker compose -f tests/e2e/docker-compose.yml up -d --build --wait
+	$(PY) samples/make_samples.py
+	$(PY) -m pytest tests/e2e -v -p no:cacheprovider; \
+		status=$$?; \
+		docker compose -f tests/e2e/docker-compose.yml logs --tail 100 > .e2e-logs.txt 2>&1 || true; \
+		docker compose -f tests/e2e/docker-compose.yml down; \
+		exit $$status
 
 lock:  ## Пересчитать uv.lock после правки зависимостей в pyproject.toml
 	uv lock

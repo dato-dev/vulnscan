@@ -174,7 +174,7 @@ flowchart TD
     VERIFY -- да --> FAIL["CDR_FAILED<br/>файл не отдаём"]
     VERIFY -- нет --> OK["clean-артефакт"]
 
-    BLOCK["malicious<br/>CDR пропускается"]
+    BLOCK["malicious<br/>CDR пропускается<br/><i>кроме deliver_blocked: strict</i>"]
 
     OK --> RES["результат"]
     FAIL --> RES
