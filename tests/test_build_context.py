@@ -482,3 +482,33 @@ def test_stand_config_is_not_committed() -> None:
     ).stdout.split()
 
     assert not tracked, f"конфигурация стенда попала в git: {tracked}"
+
+
+def test_stand_config_is_readable_by_the_service_user() -> None:
+    """Сгенерированное читается процессом внутри контейнера.
+
+    Контейнеры работают под uid 10001, а файлы создаёт пользователь раннера с
+    другим uid. Права «только владельцу» означают, что сервис их не прочитает,
+    — и проявляется это не ошибкой доступа, а `degraded` в реестре ключей и
+    `503` на каждой загрузке, то есть далеко от причины.
+
+    Секрета в этих файлах нет: они сгенерированы, живут минуты и не выходят за
+    пределы сети стенда. В бою правило другое — там владельца меняют вместе с
+    правами, об этом говорит `make config-check`.
+    """
+    import subprocess
+
+    subprocess.run(
+        [str(ROOT / ".venv" / "bin" / "python"), str(E2E / "configure_stand.py")],
+        check=True,
+        capture_output=True,
+        cwd=ROOT,
+    )
+
+    unreadable = {
+        str(path.relative_to(ROOT)): oct(path.stat().st_mode & 0o777)
+        for path in _stand_expects().values()
+        if not path.stat().st_mode & 0o004
+    }
+
+    assert not unreadable, f"сервис не сможет прочитать конфигурацию стенда: {unreadable}"
