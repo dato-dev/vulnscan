@@ -12,5 +12,20 @@
     "public_rate_limit_per_min": 60,
     "public_daily_tickets": 5000,
     "widget_on_unavailable": "block"
+  },
+  "demo-site": {
+    "fail_mode": "fail-closed",
+    "block_threshold": 80,
+    "suspicious_threshold": 30,
+    "default_profile": "standard",
+    "max_wait_ms": 5000,
+    "shadow_mode": false,
+    "rate_limit_per_min": 300,
+    "max_concurrent_scans": 8,
+    "max_upload_bytes": 16777216,
+    "public_rate_limit_per_min": 30,
+    "public_daily_tickets": 1000,
+    "widget_on_unavailable": "block",
+    "deliver_blocked": "never"
   }
 }

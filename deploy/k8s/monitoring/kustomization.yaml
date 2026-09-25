@@ -1,0 +1,52 @@
+# Скрейп метрик — ОТДЕЛЬНЫЙ компонент, а не часть базы.
+#
+#   kubectl apply -k deploy/k8s/monitoring
+#
+# Отдельно по одной причине: PodMonitor — это CRD prometheus-operator. В
+# кластере без него `kubectl apply -k base` упал бы на «no matches for kind
+# PodMonitor», и сервис не развернулся бы из-за мониторинга. База обязана
+# ставиться на любой кластер.
+#
+# ────────────────────────────────────────────────────────────────────────────
+# ПЕРЕД ПРИМЕНЕНИЕМ — ДВЕ ПРОВЕРКИ. Обе ошибки тихие: объект создан, Prometheus
+# его не видит, целей нет, и это неотличимо от «метрик нет».
+#
+# 1. Какую метку ваш Prometheus требует от мониторов. kube-prometheus-stack по
+#    умолчанию берёт только объекты с `release: <имя релиза Helm>`:
+#
+#      kubectl get prometheus -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}: {.spec.podMonitorSelector}{"\n"}{end}'
+#
+#    `{}` — берёт все, метка не нужна. `matchLabels: {release: ...}` —
+#    поставьте это значение в `labels` ниже.
+#
+# 2. Из каких namespace он их берёт:
+#
+#      kubectl get prometheus -A -o jsonpath='{range .items[*]}{.spec.podMonitorNamespaceSelector}{"\n"}{end}'
+#
+#    `{}` — из всех. Иначе `vulnscan` и `vulnscan-bot` должны под него
+#    попадать.
+#
+# И третье, не про мониторы, а про сеть: политики в `deploy/k8s/policies`
+# пускают скрейп из namespace `observability`. Живёт Prometheus в другом
+# (у kube-prometheus-stack это обычно `monitoring`) — после применения
+# политик цели станут недоступны. Поменяйте имя там же.
+#
+# Проверить, что заработало, — по самому Prometheus, а не по факту создания:
+#
+#   up{job=~"vulnscantg.*"}
+#
+# Семь целей (gateway, worker, deepscan, notifier, writer, cvdmirror, bot),
+# все со значением 1.
+# ────────────────────────────────────────────────────────────────────────────
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - pod-monitors.yaml
+
+labels:
+  - includeSelectors: false
+    pairs:
+      # ПРОВЕРЬТЕ по пункту 1 выше. Значение по умолчанию — имя релиза, если
+      # kube-prometheus-stack ставили командой из его документации.
+      release: kube-prometheus-stack

@@ -224,9 +224,17 @@ def test_mirror_reports_age(tmp_path: Path) -> None:
 def test_mirror_reports_empty_directory(tmp_path: Path) -> None:
     """Пустой каталог — работающая раздача без единой базы.
 
-    Ряд обязан существовать и быть нулём: отсутствие ряда неотличимо от
-    неработающего экспортёра, а это ровно та подмена, ради которой всё здесь.
+    Ряд обязан существовать: отсутствие ряда неотличимо от неработающего
+    экспортёра. А значение — бесконечность, не ноль.
+
+    Прежде здесь стоял ноль, и тест это закреплял. Но ноль у возраста значит
+    «обновлено только что»: пустое зеркало в кластере — то, что качать не
+    могло вовсе, — отчитывалось самой свежей базой из возможных, и любое
+    правило «возраст больше порога» на нём молчало. Правильная цель (ряд
+    есть) при неправильном значении дала ровно ту подмену, от которой
+    защищались.
     """
+    import math
     import sys
 
     sys.path.insert(0, str(Path(__file__).parent.parent / "services/cvdmirror"))
@@ -235,7 +243,8 @@ def test_mirror_reports_empty_directory(tmp_path: Path) -> None:
     exporter.collect(tmp_path)
 
     assert exporter.files._value.get() == 0
-    assert exporter.newest._value.get() == 0
+    assert math.isinf(exporter.newest._value.get()), "пустое зеркало выглядит свежим"
+    assert exporter.newest._value.get() > 86400, "правило устаревания на нём не сработает"
 
 
 # --- деградированный режим -----------------------------------------------
@@ -528,7 +537,7 @@ def test_trace_context_crosses_http() -> None:
     путь, идентификатор ключа), поэтому добавление совместимо.
     """
     root = Path(__file__).parent.parent
-    bot = (root / "services/bot/botapp/scanner.py").read_text()
+    bot = (root / "examples/telegram-bot/botapp/scanner.py").read_text()
     sdk = (root / "packages/vulnscan_client/client.py").read_text()
 
     assert 'headers["traceparent"] = traceparent' in bot, "бот не шлёт контекст"
@@ -1069,3 +1078,82 @@ def test_foreign_context_is_accepted_only_at_boundaries() -> None:
         "чужой контекст принимается не на границе: "
         f"лишние {sorted(callers - boundaries)}, потерянные {sorted(boundaries - callers)}"
     )
+
+
+# --- зеркало объясняет, почему не скачало ----------------------------------
+
+
+def _probe():
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent.parent / "services/cvdmirror"))
+    import probe
+
+    return probe
+
+
+def test_mirror_names_a_closed_cdn() -> None:
+    """403 от CDN называется прямо: с этого адреса баз не получить.
+
+    На выкате в Kubernetes зеркало узнавало версии баз и мгновенно
+    проваливало скачивание, а `cvdupdate` писал лишь «Failed to download».
+    Причину искали в сетевых политиках, которые были уже сняты. Закрытый для
+    сети CDN и закрытый выход наружу чинятся разными людьми — и различать их
+    надо по логу, а не догадкой.
+    """
+    import urllib.error
+
+    probe = _probe()
+    error = urllib.error.HTTPError(probe.URL, 403, "Forbidden", {}, None)
+
+    verdict = probe.classify(error)
+
+    assert "403" in verdict
+    assert "прокси" in verdict, "подсказка, чем это лечится, пропала"
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("dns", "DNS"),
+        ("timeout", "выход наружу закрыт"),
+        ("refused", "отвергнуто"),
+    ],
+)
+def test_mirror_tells_network_failures_apart(reason: str, expected: str) -> None:
+    """Сетевые отказы различаются между собой — у каждого свой адресат."""
+    import socket
+    import urllib.error
+
+    probe = _probe()
+    causes = {
+        "dns": socket.gaierror(-2, "Name or service not known"),
+        "timeout": TimeoutError(),
+        "refused": ConnectionRefusedError(),
+    }
+
+    verdict = probe.classify(urllib.error.URLError(causes[reason]))
+
+    assert expected in verdict
+
+
+def test_mirror_probe_does_not_leak_the_proxy(caplog: pytest.LogCaptureFixture) -> None:
+    """В лог попадает факт прокси, но не его адрес — там бывают логин и пароль."""
+    import logging
+    import urllib.error
+    from unittest import mock
+
+    probe = _probe()
+    secret = "http://user:hunter2@proxy.example:3128"
+    blocked = urllib.error.HTTPError(probe.URL, 403, "Forbidden", {}, None)
+
+    with (
+        mock.patch.dict("os.environ", {"HTTPS_PROXY": secret}),
+        mock.patch.object(probe.urllib.request, "urlopen", side_effect=blocked),
+        caplog.at_level(logging.WARNING),
+    ):
+        probe.main()
+
+    text = caplog.text
+    assert "через прокси" in text
+    assert "hunter2" not in text and "proxy.example" not in text

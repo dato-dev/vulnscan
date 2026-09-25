@@ -105,6 +105,46 @@ DEFAULT_WEIGHTS: dict[str, Rule] = {
     "IMG_TOO_MANY_FRAMES": _r(30, Severity.MEDIUM),
     "IMG_MALFORMED": _r(35, Severity.MEDIUM),
     "IMG_HAS_EXIF": _r(0, Severity.INFO),
+    # --- архивы (M6.1) ---
+    # 10 МБ, разворачивающиеся в 10 ГБ, легитимными не бывают: документы
+    # сжимаются в разы, а не в сотни раз.
+    "ARCHIVE_BOMB": _r(100, Severity.CRITICAL),
+    # Проверено не всё — вердикт `unsupported`, а не балл. Вес — чтобы у
+    # непроверенного не было «почти чисто».
+    "ARCHIVE_INCOMPLETE": _r(30, Severity.MEDIUM),
+    "ARCHIVE_ENCRYPTED": _r(40, Severity.HIGH),
+    # `../` и абсолютный путь в архиве с документами не нужны никому, кроме
+    # того, кто хочет записать файл мимо каталога распаковки.
+    "ARCHIVE_PATH_TRAVERSAL": _r(60, Severity.HIGH),
+    "ARCHIVE_SYMLINK": _r(45, Severity.HIGH),
+    # По имени. Содержимое, если это действительно PE, отдельно даст
+    # TYPE_EXECUTABLE со вложения.
+    "ARCHIVE_EXECUTABLE": _r(70, Severity.HIGH),
+    "ARCHIVE_MALFORMED": _r(35, Severity.MEDIUM),
+    # --- документы Word (M6.3) ---
+    # Макрос ниже порога блокировки намеренно: пересборка его удаляет, и
+    # пользователь получает документ без макроса. На блокировке он не получил
+    # бы ничего — ровно в самом частом случае, договоре из шаблона с макросом.
+    "DOCX_VBA": _r(70, Severity.HIGH),
+    "DOCX_ACTIVEX": _r(60, Severity.HIGH),
+    # Через встроенные OLE-объекты шли эксплойты редактора формул.
+    "DOCX_OLE_OBJECT": _r(50, Severity.HIGH),
+    # Встроенный документ: обычно таблица с данными диаграммы.
+    "DOCX_EMBEDDED": _r(10, Severity.LOW),
+    # DDE выполняет команду без макросов. Во входящих документах законного
+    # применения у него нет.
+    "DOCX_DDE": _r(90, Severity.CRITICAL),
+    "DOCX_FIELD_OBFUSCATED": _r(60, Severity.HIGH),
+    "DOCX_FIELD_INCLUDE": _r(30, Severity.MEDIUM),
+    # Шаблон или объект по сети: сам документ чист, код приезжает при
+    # открытии (CVE-2017-0199, Follina). Легитимный шаблон лежит локально.
+    "DOCX_EXTERNAL_TEMPLATE": _r(80, Severity.HIGH),
+    "DOCX_EXTERNAL_OBJECT": _r(80, Severity.HIGH),
+    "DOCX_EXTERNAL_LINK": _r(30, Severity.MEDIUM),
+    "DOCX_ALTCHUNK": _r(45, Severity.HIGH),
+    # DTD в части Word не бывает — это атака на разборщик XML.
+    "DOCX_DTD": _r(60, Severity.HIGH),
+    "DOCX_MALFORMED": _r(35, Severity.MEDIUM),
     # --- антивирус ---
     "AV_SIGNATURE_MATCH": _r(100, Severity.CRITICAL),
     "AV_ERROR": _r(10, Severity.LOW),
@@ -143,9 +183,28 @@ CODE_FAMILIES: dict[str, str] = {
     # Расширение и заявленный MIME врут об одном и том же.
     "MIME_MISMATCH": "type_lie",
     "EXT_MISMATCH": "type_lie",
-    # Тип не распознан или не поддержан — одно наблюдение.
+    # Тип не распознан или не поддержан — одно наблюдение. Сюда же
+    # непроверенная часть архива: для вердикта это то же «не проверили».
     "TYPE_UNKNOWN": "type_unsupported",
     "TYPE_UNSUPPORTED": "type_unsupported",
+    "ARCHIVE_INCOMPLETE": "type_unsupported",
+    # Путь из архива наружу: через `../` или через символическую ссылку.
+    "ARCHIVE_PATH_TRAVERSAL": "archive_escape",
+    "ARCHIVE_SYMLINK": "archive_escape",
+    # Битый контейнер: один и тот же ZIP виден и как архив, и как документ.
+    "ARCHIVE_MALFORMED": "container_broken",
+    "DOCX_MALFORMED": "container_broken",
+    # Загрузка по сети при открытии — один механизм, разные точки входа.
+    "DOCX_EXTERNAL_TEMPLATE": "docx_remote",
+    "DOCX_EXTERNAL_OBJECT": "docx_remote",
+    "DOCX_EXTERNAL_LINK": "docx_remote",
+    # Опасное поле и его маскировка обычно одно и то же поле.
+    "DOCX_DDE": "docx_field",
+    "DOCX_FIELD_OBFUSCATED": "docx_field",
+    "DOCX_FIELD_INCLUDE": "docx_field",
+    # Встроенный объект виден и по имени части, и по связи.
+    "DOCX_OLE_OBJECT": "docx_embedded",
+    "DOCX_EMBEDDED": "docx_embedded",
 }
 """Коррелированные признаки.
 

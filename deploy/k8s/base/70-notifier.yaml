@@ -1,0 +1,179 @@
+# Доставка результатов: коллбэки клиентам и выгрузка копий в их хранилища.
+#
+# Вынесен из воркера потому, что держит ключи тенантов и ходит наружу. Здесь
+# это допустимо: недоверенный контент он не разбирает.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    # Перезапуск при изменении ConfigMap и Secret, на которые ссылается этот
+    # объект (Stakater Reloader). Нужен он ровно там, где обновление не
+    # доезжает само: секреты, смонтированные через `subPath`, обновлений НЕ
+    # получают вовсе, а переменные окружения читаются один раз при старте.
+    #
+    # ConfigMap с политиками из этого исключён — см. `10-config.yaml`.
+    reloader.stakater.com/auto: "true"
+  name: notifier
+  namespace: vulnscan
+  labels:
+    app: notifier
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notifier
+  template:
+    metadata:
+      labels:
+        app: notifier
+    spec:
+      serviceAccountName: notifier
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: notifier
+          image: dato1/vulnscantg-notifier:latest
+          ports:
+            - name: metrics
+              containerPort: 9103
+          envFrom:
+            - configMapRef:
+                name: vulnscan-env
+            - secretRef:
+                name: vulnscan-credentials
+          env:
+            - name: IMAGE_TAG
+              value: latest
+            - name: METRICS_PORT
+              value: "9103"
+            - name: DELIVERY_CREDENTIALS_FILE
+              value: /app/secrets/delivery.json
+            - name: CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: keys
+              mountPath: /app/secrets/keys.json
+              subPath: keys.json
+              readOnly: true
+            - name: delivery
+              mountPath: /app/secrets/delivery.json
+              subPath: delivery.json
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        # Два разных Secret в один каталог — поэтому `subPath`. Цена subPath:
+        # обновление Secret в такой монтировке НЕ доезжает до пода, в отличие
+        # от обычной. Для ключей это важно (M11.7): ротация потребует
+        # `rollout restart`, и это записано в README, чтобы не выяснять на
+        # ротации.
+        - name: keys
+          secret:
+            secretName: vulnscan-keys
+            defaultMode: 0444
+        - name: delivery
+          secret:
+            secretName: vulnscan-delivery
+            defaultMode: 0444
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
+---
+# История проверок. Единственный сервис с доступом к PostgreSQL.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    # Перезапуск при изменении ConfigMap и Secret, на которые ссылается этот
+    # объект (Stakater Reloader). Нужен он ровно там, где обновление не
+    # доезжает само: секреты, смонтированные через `subPath`, обновлений НЕ
+    # получают вовсе, а переменные окружения читаются один раз при старте.
+    #
+    # ConfigMap с политиками из этого исключён — см. `10-config.yaml`.
+    reloader.stakater.com/auto: "true"
+  name: writer
+  namespace: vulnscan
+  labels:
+    app: writer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: writer
+  template:
+    metadata:
+      labels:
+        app: writer
+    spec:
+      serviceAccountName: writer
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: writer
+          image: dato1/vulnscantg-writer:v1.0.1
+          ports:
+            - name: metrics
+              containerPort: 9101
+          envFrom:
+            - configMapRef:
+                name: vulnscan-env
+            - secretRef:
+                name: vulnscan-credentials
+          env:
+            - name: IMAGE_TAG
+              value: latest
+            - name: METRICS_PORT
+              value: "9101"
+            - name: CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

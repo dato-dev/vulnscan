@@ -1,0 +1,212 @@
+# Разбор недоверенных файлов. Периметр.
+#
+# Здесь собраны все гарантии, которые в compose держал `internal: true` плюс
+# `read_only`, `tmpfs`, `cap_drop`. Каждая переехала своим механизмом, и почти
+# каждая умеет молча не сработать — поэтому на них есть тесты
+# (tests/test_k8s_manifests.py), а сетевая изоляция проверяется запуском.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    # Перезапуск при изменении ConfigMap и Secret, на которые ссылается этот
+    # объект (Stakater Reloader). Нужен он ровно там, где обновление не
+    # доезжает само: секреты, смонтированные через `subPath`, обновлений НЕ
+    # получают вовсе, а переменные окружения читаются один раз при старте.
+    #
+    # ConfigMap с политиками из этого исключён — см. `10-config.yaml`.
+    reloader.stakater.com/auto: "true"
+  name: worker
+  namespace: vulnscan
+  labels:
+    app: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      serviceAccountName: worker
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: dato1/vulnscantg-worker:v1.0.1
+          ports:
+            - name: metrics
+              containerPort: 9100
+          envFrom:
+            - configMapRef:
+                name: vulnscan-env
+            - secretRef:
+                name: vulnscan-credentials
+          env:
+            - name: IMAGE_TAG
+              value: latest
+            - name: METRICS_PORT
+              value: "9100"
+            - name: WORK_DIR
+              value: /dev/shm/vulnscan
+            # Имя потребителя в группе Redis Stream — из имени пода (M11.10).
+            # Одинаковое имя у двух реплик означает общий список
+            # необработанных сообщений, и `reclaim` начинает отбирать задачи
+            # сам у себя.
+            - name: CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            # Политика и веса — ДА. Ключи тенантов — НЕТ (D7): это процесс,
+            # разбирающий враждебные файлы, и секреты в нём превращают дыру в
+            # парсере в компрометацию всех клиентов сразу.
+            - name: policies
+              mountPath: /app/config
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            # Второй слой защиты от бомб: первый — rlimits внутри
+            # `run_sandboxed`, этот — снаружи. Без него разбор специально
+            # собранного файла выселит соседей по узлу (M11.12).
+            limits:
+              cpu: "2"
+              memory: 2Gi
+      volumes:
+        - name: policies
+          configMap:
+            name: vulnscan-policies
+            defaultMode: 0444
+        # `medium: Memory` — не оптимизация (M11.2). Правило «ничего не оседает
+        # на диске после обработки» держится на том, что WORK_DIR это память.
+        # emptyDir по умолчанию ДИСК, и разница не видна ни по логам, ни по
+        # вердиктам: сервис работает одинаково.
+        #
+        # `sizeLimit` обязателен: память тома считается в лимит пода, и без
+        # него бомба распаковки выселит под вместо того, чтобы упереться в
+        # лимит.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+---
+# Углублённая проверка: тот же образ, другая роль.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    # Перезапуск при изменении ConfigMap и Secret, на которые ссылается этот
+    # объект (Stakater Reloader). Нужен он ровно там, где обновление не
+    # доезжает само: секреты, смонтированные через `subPath`, обновлений НЕ
+    # получают вовсе, а переменные окружения читаются один раз при старте.
+    #
+    # ConfigMap с политиками из этого исключён — см. `10-config.yaml`.
+    reloader.stakater.com/auto: "true"
+  name: deepscan
+  namespace: vulnscan
+  labels:
+    app: deepscan
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepscan
+  template:
+    metadata:
+      labels:
+        app: deepscan
+    spec:
+      serviceAccountName: deepscan
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: deepscan
+          image: dato1/vulnscantg-worker:latest
+          ports:
+            - name: metrics
+              containerPort: 9100
+          envFrom:
+            - configMapRef:
+                name: vulnscan-env
+            - secretRef:
+                name: vulnscan-credentials
+          env:
+            - name: IMAGE_TAG
+              value: latest
+            - name: METRICS_PORT
+              value: "9100"
+            - name: WORKER_MODE
+              value: deep
+            - name: WORK_DIR
+              value: /dev/shm/vulnscan
+            # Углублённая проверка не спешит и берёт по одному файлу: она идёт
+            # без ограничений на стоимость разбора.
+            - name: CONCURRENCY
+              value: "1"
+            - name: CONSUMER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: policies
+              mountPath: /app/config
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+      volumes:
+        - name: policies
+          configMap:
+            name: vulnscan-policies
+            defaultMode: 0444
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi

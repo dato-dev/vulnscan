@@ -7,13 +7,20 @@ from pathlib import Path
 
 from vscommon.models import CdrProfile
 
+from .archive import ZipSanitizer
 from .base import SanitizeError, SanitizeOutcome, Sanitizer
+from .docx import DocxSanitizer
 from .image import ImageSanitizer
 from .pdf import PdfSanitizer
 
 logger = logging.getLogger(__name__)
 
-_SANITIZERS: tuple[Sanitizer, ...] = (PdfSanitizer(), ImageSanitizer())
+_SANITIZERS: tuple[Sanitizer, ...] = (
+    PdfSanitizer(),
+    ImageSanitizer(),
+    DocxSanitizer(),
+    ZipSanitizer(),
+)
 
 
 def find_sanitizer(mime: str | None) -> Sanitizer | None:

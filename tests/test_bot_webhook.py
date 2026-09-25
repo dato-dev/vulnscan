@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services" / "bot"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "telegram-bot"))
 
 from botapp import webhook
 from botapp.delivery import DeliveryLedger

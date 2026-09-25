@@ -1,6 +1,6 @@
 [project]
 name = "vulnscantg"
-version = "0.1.0"
+version = "2.0.0"
 description = "CDR и детект вредоносного содержимого во вложениях чат-бота"
 requires-python = ">=3.12"
 
@@ -58,6 +58,15 @@ bot = [
     "uvicorn[standard]>=0.32",
 ]
 
+# Бот-форма обратной связи. Ставится на отдельный сервер, к сканеру ходит
+# через `vulnscan_client` (ему нужен только httpx), в S3 пишет карточки.
+feedbackbot = [
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "httpx>=0.28",
+    "boto3>=1.35",
+]
+
 writer = [
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -75,6 +84,15 @@ notifier = [
     # (M14.1). Забыли эту строку — образ собрался, а сервис упал на
     # `ModuleNotFoundError` при старте: далеко от причины и только в бою.
     "boto3>=1.35",
+]
+
+# Сайт документации на GitHub Pages. Собирается только в CI и локально, в
+# образы не едет.
+docs = [
+    "mkdocs-material>=9.5",
+    # MkDocs 2.0 ломает темы и плагины без пути миграции (предупреждение
+    # самой Material). Переход — отдельным решением, не очередным `uv lock`.
+    "mkdocs>=1.6,<2",
 ]
 
 demo-site = [
@@ -119,7 +137,9 @@ dev = [
     { include-group = "bot" },
     { include-group = "writer" },
     { include-group = "notifier" },
+    { include-group = "feedbackbot" },
     { include-group = "demo-site" },
+    { include-group = "docs" },
     { include-group = "telemetry" },
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
@@ -150,9 +170,10 @@ src = [
     "packages",
     "services/gateway",
     "services/worker",
-    "services/bot",
+    "examples/telegram-bot",
     "services/writer",
     "services/notifier",
+    "examples/feedbackbot",
     "tests",
 ]
 
@@ -181,7 +202,7 @@ ignore = [
 "deploy/configure.py" = ["T20"]
 "corpus/*" = ["T20", "E402", "S310"]  # печать отчёта и загрузка по фиксированному URL   # печать результатов и импорт после sys.path
 "packages/vscommon/config.py" = ["S105"]
-"services/bot/botapp/config.py" = ["S105"]  # дефолт-заглушка, значение из env   # дефолты-заглушки, реальные значения из env
+"examples/telegram-bot/botapp/config.py" = ["S105"]  # дефолт-заглушка, значение из env   # дефолты-заглушки, реальные значения из env
 "services/worker/worker_app/config.py" = ["S108"] # /dev/shm — намеренный tmpfs, не /tmp
 # Отчёт для оператора, а не цикл сервиса: его вывод и есть результат работы.
 # Запрет на print защищает горячий путь от записи мимо структурных логов —

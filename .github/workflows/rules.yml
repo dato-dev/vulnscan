@@ -18,6 +18,7 @@ on:
       - "rules/**"
       - "packages/vscommon/weights.py"
       - "services/worker/worker_app/stages/yara_rules.py"
+      - "services/worker/worker_app/yara_views.py"
       - ".github/workflows/rules.yml"
   push:
     branches: [main]
@@ -25,6 +26,7 @@ on:
       - "rules/**"
       - "packages/vscommon/weights.py"
       - "services/worker/worker_app/stages/yara_rules.py"
+      - "services/worker/worker_app/yara_views.py"
   workflow_dispatch:
 
 jobs:

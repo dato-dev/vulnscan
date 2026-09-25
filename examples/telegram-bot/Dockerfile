@@ -33,7 +33,7 @@ RUN uv export --frozen --no-default-groups --group bot --group telemetry \
     && rm /tmp/requirements.txt
 
 COPY packages/vscommon /app/vscommon
-COPY services/bot/botapp /app/botapp
+COPY examples/telegram-bot/botapp /app/botapp
 
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin vulnscan
 USER 10001

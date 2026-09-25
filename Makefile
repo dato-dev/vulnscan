@@ -4,7 +4,7 @@
 
 # Локальный venv используется, если он есть: системный python может быть старее 3.12.
 PY := $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
-export PYTHONPATH := packages:services/gateway:services/worker:services/bot:services/writer:services/notifier
+export PYTHONPATH := packages:services/gateway:services/worker:examples/telegram-bot:services/writer:services/notifier:examples/feedbackbot
 
 help:
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-12s %s\n", $$1, $$2}'
@@ -16,12 +16,16 @@ NAMESPACE  ?=
 PROJECT    ?= vulnscantg
 TAG        ?= $(shell git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d-%H%M)
 PLATFORMS  ?= linux/amd64
-SERVICES   ?= gateway worker bot cvdmirror writer notifier
+SERVICES   ?= gateway worker bot cvdmirror writer notifier feedbackbot
 
-# Пример подключения лежит вне `services/`: это не часть сервиса, а показ того,
-# как к нему подключаются, и у него свой compose. Правило сборки общее, поэтому
-# путь до Dockerfile выбирается здесь, а не дублируется отдельной целью.
-dockerfile = $(if $(filter demo-site,$*),examples/feedback-site/Dockerfile,services/$*/Dockerfile)
+# Примеры подключения — оба бота и сайт — лежат вне `services/`: это не часть
+# сервиса, а показ того, как к нему подключаются, у каждого свой compose.
+# Правило сборки общее, поэтому путь до Dockerfile выбирается здесь, а не
+# дублируется отдельной целью. Имя образа от переезда не меняется.
+EXAMPLE_bot         := examples/telegram-bot
+EXAMPLE_feedbackbot := examples/feedbackbot
+EXAMPLE_demo-site   := examples/feedback-site
+dockerfile = $(or $(EXAMPLE_$*),services/$*)/Dockerfile
 BUILDER    ?= vulnscan
 
 # Docker Hub не поддерживает вложенные пространства имён, поэтому сервис
@@ -99,7 +103,7 @@ fmt:  ## Форматирование
 	$(PY) -m ruff check --fix .
 
 typecheck:  ## Проверка типов
-	$(PY) -m mypy packages services
+	$(PY) -m mypy packages services examples/feedbackbot/feedbackapp
 
 check-stack:  ## Проверить конфигурацию мониторинга (нужен Docker)
 	@# M10.5: до выката, а не по логам упавшего контейнера. Коллектор уже
@@ -127,7 +131,7 @@ corpus-check:  ## Регрессия на ложные срабатывания 
 test-e2e:  ## Сквозной прогон доставки: поднимает стек и гоняет по нему файлы
 	# Первый запуск долгий: clamd тянет антивирусные базы. Том переживает
 	# прогоны, дальше быстро.
-	$(PY) tests/e2e/configure_sink.py
+	$(PY) tests/e2e/configure_stand.py
 	docker compose -f tests/e2e/docker-compose.yml up -d --build --wait
 	$(PY) samples/make_samples.py
 	$(PY) -m pytest tests/e2e -v -p no:cacheprovider; \

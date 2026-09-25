@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from fakeredis import aioredis
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services" / "bot"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "telegram-bot"))
 
 from botapp.scanner import ScanOutcome
 from vscommon.models import (

@@ -37,7 +37,13 @@ class FakeRules:
     def __init__(self, label: str) -> None:
         self.label = label
 
-    def match(self, path: str, timeout: int = 0) -> list:
+    def match(
+        self,
+        path: str | None = None,
+        timeout: int = 0,
+        externals: dict | None = None,
+        data: bytes | None = None,
+    ) -> list:
         return []
 
 

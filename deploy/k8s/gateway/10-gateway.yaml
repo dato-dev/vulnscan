@@ -1,0 +1,91 @@
+# Внешний вход кластера. Реализация — Cilium.
+#
+# ────────────────────────────────────────────────────────────────────────────
+# ПЕРЕД ПРИМЕНЕНИЕМ ПРОВЕРЬТЕ, ЧТО GATEWAY API У CILIUM ВКЛЮЧЁН
+#
+#   kubectl get gatewayclass
+#
+# Должен быть класс `cilium` со `ACCEPTED: True`. Если списка нет вовсе —
+# в кластере не установлены CRD Gateway API; если класс есть, но не принят —
+# у Cilium не включён `gatewayAPI.enabled=true`.
+#
+# Молчаливый отказ здесь такой: Gateway создаётся, висит без адреса, и
+# единственное место, где написана причина, — его `status`.
+#
+# АДРЕС. Cilium заводит под Gateway Service типа LoadBalancer. На bare-metal
+# адрес выдаёт LB IPAM Cilium (`CiliumLoadBalancerIPPool`) и анонсирует L2 или
+# BGP. Нет ни того, ни другого — Service навсегда останется в `<pending>`, и
+# Gateway тоже. Закрепить конкретный адрес из пула:
+#
+#   metadata.annotations:
+#     io.cilium/lb-ipam-ips: 192.168.1.50
+#
+# ПРОВЕРИТЬ ПОСЛЕ ПРИМЕНЕНИЯ — по статусу, а не по факту создания:
+#
+#   kubectl -n gateway get gateway vulnscan -o wide
+#   kubectl -n gateway describe gateway vulnscan | sed -n '/Status:/,$p'
+#
+# Нужны `Accepted: True` и `Programmed: True`, и непустой `ADDRESS`.
+# ────────────────────────────────────────────────────────────────────────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: vulnscan
+  namespace: gateway
+  # Закрепить адрес из пула Cilium — раскомментируйте и поставьте свой. Без
+  # этого адрес выдаётся любой свободный и меняется при пересоздании Gateway,
+  # а за ним придётся каждый раз править DNS.
+  #
+  # annotations:
+  #   io.cilium/lb-ipam-ips: 192.168.1.50
+spec:
+  gatewayClassName: cilium
+  listeners:
+    # Имя listener'а — это то, что маршрут указывает в `sectionName`.
+    # `http` и `https` здесь просто имена, а не протоколы: протокол ниже.
+    - name: http
+      protocol: HTTP
+      port: 80
+      hostname: "*.abdullin.lab"
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              # Метка `kubernetes.io/metadata.name` ставится на каждый
+              # namespace автоматически — свою заводить не нужно.
+              kubernetes.io/metadata.name: vulnscan
+
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.abdullin.lab"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          # Secret с сертификатом и ключом, тип `kubernetes.io/tls`. Лежит
+          # рядом с Gateway: сертификат в чужом namespace потребовал бы
+          # ReferenceGrant, а это лишняя сущность на ровном месте.
+          #
+          # Через cert-manager — снимите комментарий с аннотации ниже и он
+          # создаст Secret сам:
+          #   cert-manager.io/cluster-issuer: <имя вашего issuer>
+          #
+          # Самоподписанный, чтобы поднять прямо сейчас:
+          #   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+          #       -keyout tls.key -out tls.crt \
+          #       -subj "/CN=scan.abdullin.lab" \
+          #       -addext "subjectAltName=DNS:scan.abdullin.lab"
+          #   kubectl -n gateway create secret tls vulnscan-tls \
+          #       --cert=tls.crt --key=tls.key
+          - name: vulnscan-tls
+      allowedRoutes:
+        namespaces:
+          # Разрешение привязки — ЗДЕСЬ, а не в маршруте. Маршрут из чужого
+          # namespace без этого остаётся неприкреплённым с причиной
+          # `NotAllowedByListeners`: `kubectl apply` проходит, объект создан,
+          # трафика нет. Это самая частая тихая поломка Gateway API.
+          from: Selector
+          selector:
+            matchLabels:
+              kubernetes.io/metadata.name: vulnscan

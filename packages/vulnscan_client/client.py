@@ -6,9 +6,13 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import ssl
+import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -20,6 +24,9 @@ TIMESTAMP_HEADER = "X-Vulnscan-Timestamp"
 KEY_ID_HEADER = "X-Vulnscan-Key"
 
 MAX_SKEW_S = 300
+
+PENDING_STATUSES = frozenset({"queued", "scanning"})
+"""Проверка идёт, вердикта ещё нет — читать его нельзя."""
 
 SAFE_VERDICTS = frozenset({"clean"})
 """Что считается пригодным без оговорок.
@@ -67,6 +74,75 @@ class ScanOutcome:
     def unscannable(self) -> bool:
         """Проверить не удалось: формат не поддержан, файл зашифрован и т.п."""
         return self.verdict in {"unsupported", "encrypted"}
+
+
+@dataclass(frozen=True, slots=True)
+class CleanCopy:
+    """Пересобранная копия вместе с тем, что о ней сказал сервис.
+
+    Формат копии не обязан совпадать с присланным: GIF пересобирается в PNG,
+    PDF в профиле `strict` — в страницы-картинки. Угадывать его по имени
+    исходника — значит отдать посетителю файл с чужим расширением.
+    """
+
+    content: bytes
+    content_type: str
+    filename: str
+    """Имя, которое предложил сервис. Состоит из идентификатора и расширения,
+    имени исходного файла в нём нет."""
+
+
+def resolve_ca_file(path: str) -> str | bool:
+    """Значение `verify` для клиента по пути к сертификату своего центра.
+
+    * пусто или не обычный файл-устройство вроде `/dev/null` — `True`,
+      системные центры. Так в docker compose выглядит необязательное
+      монтирование: `${CA:-/dev/null}:/путь/ca.crt`;
+    * читаемый непустой файл — путь к нему;
+    * всё остальное — `ValueError` с объяснением.
+
+    Без этой проверки ошибка выглядит как `PermissionError` из глубины `ssl`
+    при создании клиента: не сказано ни какой файл, ни чего не хватает. А
+    причины у неё почти всегда одни и те же — ниже они и названы.
+    """
+    if not path:
+        return True
+    target = Path(path)
+    try:
+        info = target.stat()
+    except PermissionError:
+        raise ValueError(
+            f"{path}: нет доступа к каталогу, в котором лежит файл, у uid {os.getuid()}. "
+            "Часто это путь внутри /root: процесс в контейнере запущен не от root."
+        ) from None
+    except FileNotFoundError:
+        raise ValueError(f"{path}: файла нет — сертификат не смонтирован по этому пути") from None
+    if stat.S_ISCHR(info.st_mode):
+        return True  # /dev/null: свой центр не задан
+    if stat.S_ISDIR(info.st_mode):
+        raise ValueError(
+            f"{path}: это каталог. Docker создаёт его сам, если файла, который "
+            "монтируют, на хосте нет, — проверьте путь на хосте."
+        )
+    if not stat.S_ISREG(info.st_mode) or info.st_size == 0:
+        raise ValueError(f"{path}: не файл сертификата или файл пустой")
+    if not os.access(target, os.R_OK):
+        raise ValueError(
+            f"{path}: не читается процессом с uid {os.getuid()}. Сертификат центра — "
+            "не секрет: на хосте ему достаточно `chmod 644`."
+        )
+    try:
+        ssl.create_default_context(cafile=path)
+    except ssl.SSLError as exc:
+        raise ValueError(
+            f"{path}: не разбирается как сертификат в формате PEM"
+            + (f" ({exc.reason})" if exc.reason else "")
+            + ". "
+            "Нужен сертификат ЦЕНТРА, а не сервера, и в тексте: "
+            "-----BEGIN CERTIFICATE-----. DER переводится так: "
+            "openssl x509 -inform der -in ca.der -out ca.crt"
+        ) from None
+    return path
 
 
 def _sign(secret: str, payload: bytes, timestamp: int | None = None) -> tuple[str, str]:
@@ -123,6 +199,7 @@ class VulnscanClient:
         callback_url: str | None = None,
         retries: int = 3,
         trace_context: Callable[[], str | None] | None = None,
+        verify: bool | str = True,
     ) -> None:
         self._base = base_url.rstrip("/")
         self._key_id = key_id
@@ -131,7 +208,11 @@ class VulnscanClient:
         self._callback_url = callback_url
         self._retries = retries
         self._trace_context = trace_context
-        self._http = httpx.AsyncClient(timeout=timeout_s)
+        # `verify` — путь к сертификату своего центра сертификации, если сервис
+        # стоит за TLS, выпущенным не публичным центром. Отключать проверку
+        # (`False`) допустимо только на стенде: ключ подписи уходит в каждом
+        # запросе, и без проверки сертификата его заберёт любой посредник.
+        self._http = httpx.AsyncClient(timeout=timeout_s, verify=verify)
 
     async def __aenter__(self) -> VulnscanClient:
         return self
@@ -207,13 +288,24 @@ class VulnscanClient:
         return _to_outcome(payload)
 
     async def download_clean(self, scan_id: str) -> bytes:
-        """Скачивает обезвреженную копию."""
+        """Скачивает обезвреженную копию. Тип и имя — см. `download_clean_copy`."""
+        return (await self.download_clean_copy(scan_id)).content
+
+    async def download_clean_copy(self, scan_id: str) -> CleanCopy:
+        """Скачивает обезвреженную копию вместе с её типом и именем."""
         path = f"/v1/scan/{scan_id}/clean"
         headers = self._headers(_canonical("GET", path, self._key_id))
-        response = await self._http.get(f"{self._base}{path}", headers=headers)
+        try:
+            response = await self._http.get(f"{self._base}{path}", headers=headers)
+        except httpx.HTTPError as exc:
+            raise VulnscanError(f"обезвреженная копия недоступна: {exc}") from exc
         if response.status_code >= 400:
             raise VulnscanError(f"обезвреженная копия недоступна: {response.status_code}")
-        return response.content
+        return CleanCopy(
+            content=response.content,
+            content_type=response.headers.get("content-type", "application/octet-stream"),
+            filename=_filename(response.headers.get("content-disposition", "")) or scan_id,
+        )
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         """Повторяет только то, что осмысленно повторять.
@@ -240,6 +332,17 @@ class VulnscanClient:
         raise VulnscanError(f"сервис недоступен: {last}")
 
 
+def _filename(disposition: str) -> str:
+    """Имя из `Content-Disposition`. Только последний сегмент пути и без кавычек:
+    имя придумал сервер, но класть его на диск как есть всё равно нельзя."""
+    for part in disposition.split(";"):
+        key, _, value = part.strip().partition("=")
+        if key.lower() == "filename":
+            name = value.strip().strip('"').replace("\\", "/").rsplit("/", 1)[-1]
+            return name if name not in ("", ".", "..") else ""
+    return ""
+
+
 def _to_outcome(payload: dict[str, Any]) -> ScanOutcome:
     status = str(payload.get("status", ""))
     return ScanOutcome(
@@ -247,7 +350,10 @@ def _to_outcome(payload: dict[str, Any]) -> ScanOutcome:
         verdict=str(payload.get("verdict", "")),
         score=int(payload.get("score", 0)),
         status=status,
-        pending=status in {"queued", "running"},
+        # Статусы из протокола (docs/protocol.md). Здесь было `running` —
+        # такого статуса сервис не отдаёт, а настоящий `scanning` проходил как
+        # завершённая проверка без вердикта: опрос прекращался посреди работы.
+        pending=status in PENDING_STATUSES,
         sanitized=payload.get("sanitized") is not None,
         findings=list(payload.get("findings") or []),
         raw=payload,

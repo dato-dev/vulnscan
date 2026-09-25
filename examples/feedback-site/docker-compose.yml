@@ -1,55 +1,75 @@
-# Демонстрационный сайт с формой обратной связи.
+# Сайт с формой обратной связи — пример подключения на отдельном сервере.
 #
-# Отдельный файл намеренно: это пример подключения, а не часть сервиса, и
-# в основном compose ему делать нечего — там он только мешал профилями.
+# Сканер здесь не поднимается: он в Kubernetes, сайт ходит к нему по HTTPS
+# через Gateway API, как любая чужая команда. Внутренних сетей сканера сайт
+# не видит и видеть не должен.
 #
-#   docker compose -f docker-compose.yml up -d
+#   cp .env.example .env   # заполнить
+#   docker compose up -d
 #
-# Требует, чтобы сканер уже работал: сайт подключается к его внутренней сети.
+# Где лежит репозиторий, образ можно собрать здесь же: `docker compose build`.
+# На сервер он едет образом.
 
-name: vulnscan-demo
+name: feedback-site
 
 services:
   demo-site:
-    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-demo-site:${IMAGE_TAG:-latest}
-
-    # Собирается там, где есть репозиторий. На сервер едет образом: туда
-    # копируется только каталог deploy, исходников там нет.
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-demo-site:${IMAGE_TAG:?задайте IMAGE_TAG в .env — явный тег, а не latest}
     build:
       context: ../..
       dockerfile: examples/feedback-site/Dockerfile
 
-    networks:
-      # Внутренняя сеть сканера: по ней сайт ходит к gateway.
-      vulnscan_backend:
-      # Нужна НЕ для связи наружу, а чтобы опубликовать порт: в сети с
-      # `internal: true` Docker публикацию не выполняет, причём молча —
-      # `ports` в файле есть, а отображения нет.
-      vulnscan_egress:
-
     environment:
-      # Чем помечен образ при сборке — процессу это знать неоткуда,
-      # а вопрос «что сейчас работает» возникает при каждой аварии.
-      IMAGE_TAG: ${IMAGE_TAG:-latest}
-      # Публичный ключ сайта: лежит в HTML открыто, подписать им нельзя.
-      SCANNER_SITE_KEY: ${SCANNER_SITE_KEY:-}
-      # Адрес сканера ГЛАЗАМИ БРАУЗЕРА. Внутреннее имя `gateway` снаружи не
-      # резолвится, и виджет молча не загрузится — в консоли будет ошибка сети,
-      # а на странице пустое место.
-      SCANNER_PUBLIC_URL: ${SCANNER_PUBLIC_URL:-http://localhost:8080}
-      SCANNER_URL: http://gateway:8080
+      # Чем помечен образ — процессу это знать неоткуда, а вопрос «что сейчас
+      # работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG}
+      # Адрес сканера для вызовов сервер-серверу: внешний, за Gateway API.
+      SCANNER_URL: ${SCANNER_URL:?задайте SCANNER_URL в .env}
+      # Адрес сканера глазами БРАУЗЕРА посетителя — для виджета. Пусто —
+      # тот же, что SCANNER_URL.
+      SCANNER_PUBLIC_URL: ${SCANNER_PUBLIC_URL:-}
       SCANNER_KEY_ID: ${DEMO_KEY_ID:?задайте DEMO_KEY_ID в .env}
       SCANNER_SECRET: ${DEMO_SECRET:?задайте DEMO_SECRET в .env}
+      # Публичный ключ для виджета. Пусто — страница /widget скажет, что его нет.
+      SCANNER_SITE_KEY: ${SCANNER_SITE_KEY:-}
+      # Путь фиксирован и совпадает с точкой монтирования ниже. Второй
+      # переменной «путь в контейнере» больше нет: две настройки, обязанные
+      # совпадать, однажды разошлись — и сайт упал на старте, не сказав почему.
+      SCANNER_CA_FILE: /etc/feedback-site/ca.crt
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-16}
+      METRICS_PORT: "9108"
+
+    volumes:
+      # Сертификат своего центра, если TLS на входе в кластер выпущен не
+      # публичным. Не задан — сюда монтируется /dev/null, и сайт доверяет
+      # системным центрам.
+      - ${SCANNER_CA_FILE_ON_HOST:-/dev/null}:/etc/feedback-site/ca.crt:ro
 
     ports:
       - "${DEMO_PORT:-8000}:8000"
+      # Метрики — отдельным портом и по умолчанию только на localhost: сайт
+      # смотрит в интернет, а /metrics на нём был бы открыт каждому. Если
+      # Prometheus ходит сюда с другой машины, задайте METRICS_BIND адресом
+      # внутренней сети, а не 0.0.0.0.
+      - "${METRICS_BIND:-127.0.0.1}:${METRICS_PORT:-9108}:9108"
 
+    read_only: true
+    tmpfs:
+      # Сюда разбор формы складывает крупные вложения, пока они не прочитаны.
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
     restart: unless-stopped
-
-networks:
-  # Сети создаёт основной compose сканера, здесь только подключаемся.
-  # Имена — с префиксом проекта `vulnscan`.
-  vulnscan_backend:
-    external: true
-  vulnscan_egress:
-    external: true

@@ -62,7 +62,13 @@ class _Rules:
     def __init__(self, *rules: str) -> None:
         self._rules = rules
 
-    def match(self, path: str, timeout: int = 0) -> list[_Match]:
+    def match(
+        self,
+        path: str | None = None,
+        timeout: int = 0,
+        externals: dict | None = None,
+        data: bytes | None = None,
+    ) -> list[_Match]:
         return [_Match(rule) for rule in self._rules]
 
 
@@ -316,7 +322,13 @@ def test_broken_candidate_does_not_break_the_scan(
     """
 
     class _Exploding:
-        def match(self, path: str, timeout: int = 0) -> list[_Match]:
+        def match(
+            self,
+            path: str | None = None,
+            timeout: int = 0,
+            externals: dict | None = None,
+            data: bytes | None = None,
+        ) -> list[_Match]:
             raise RuntimeError("кандидат сломан")
 
     stage = _stage(tmp_path, monkeypatch, "pdf_launch_action")

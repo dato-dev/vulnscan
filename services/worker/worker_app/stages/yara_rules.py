@@ -15,6 +15,7 @@ from vscommon.limits import STAGE_TIMEOUT_S
 from vscommon.metrics import metrics
 
 from ..config import settings
+from ..yara_views import EXTERNALS, views
 from .base import ScanContext, Stage
 
 logger = logging.getLogger(__name__)
@@ -232,7 +233,7 @@ class YaraStage(Stage):
             logger.warning("правила YARA не найдены", extra={"dir": settings.yara_rules_dir})
             return None
 
-        compiled = yara.compile(filepaths=sources)
+        compiled = yara.compile(filepaths=sources, externals=EXTERNALS)
         logger.info("правила YARA скомпилированы", extra={"count": len(sources)})
         return compiled
 
@@ -260,7 +261,7 @@ class YaraStage(Stage):
         import yara
 
         try:
-            compiled = yara.compile(filepaths={p.stem: str(p) for p in files})
+            compiled = yara.compile(filepaths={p.stem: str(p) for p in files}, externals=EXTERNALS)
         except Exception:
             logger.exception("набор-кандидат не компилируется, канарейка выключена")
             metrics().config_reloads.labels(kind="yara_candidate", outcome="failed").inc()
@@ -295,14 +296,28 @@ class YaraStage(Stage):
             ctx.engines["yara"] = {"status": "no_rules"}
             return
 
-        with self._lock:
-            matches = rules.match(str(ctx.path), timeout=int(STAGE_TIMEOUT_S["yara"]))
+        candidate = self._candidate
+        found: set[str] = set()
+        candidate_ok = candidate is not None
+        matches: list[tuple[Any, str]] = []
+        deadline = time.monotonic() + STAGE_TIMEOUT_S["yara"]
+        for part, data in views(ctx.path, ctx.detected_mime):
+            if part and time.monotonic() > deadline:
+                # Части документа кончились раньше времени. Стадия не
+                # обязательная, но молча недосмотреть — значит выдать
+                # отсутствие совпадений за проверенное.
+                ctx.add(self.name, "STAGE_TIMEOUT", "не все части документа проверены")
+                break
+            with self._lock:
+                matches += [(m, part) for m in _match(rules, ctx.path, part, data)]
+            if candidate_ok:
+                candidate_ok = self._match_candidate(candidate, ctx, part, data, found)
 
         # Отсев после сопоставления, а не до: правило остаётся
         # скомпилированным, и включить его обратно — снова одна строка в
         # Redis, без чтения файлов и без риска, что набор в этот момент не
         # компилируется.
-        kept = [match for match in matches if match.rule not in self._disabled]
+        kept = [(match, part) for match, part in matches if match.rule not in self._disabled]
         suppressed = len(matches) - len(kept)
 
         ctx.engines["yara"] = {"status": "ok", "matches": len(kept)}
@@ -311,19 +326,24 @@ class YaraStage(Stage):
             # скана не объяснить — правило было, признака нет.
             ctx.engines["yara"]["suppressed"] = suppressed
 
-        for match in kept:
+        for match, part in kept:
             tag = next((t for t in match.tags if t in WEIGHT_TAGS), DEFAULT_TAG)
             ctx.add(
                 self.name,
                 f"YARA_{match.rule.upper()}",
-                match.rule,
+                # Имя части — стандартное имя внутри пакета Word, а не имя
+                # файла пользователя: ПДн в нём нет.
+                f"{match.rule} в {part}" if part else match.rule,
                 weight_key=f"YARA:{tag}",
             )
 
-        self._run_candidate(ctx, active={match.rule for match in kept})
+        if candidate_ok:
+            self._compare_candidate(ctx, active={match.rule for match, _ in kept}, found=found)
 
-    def _run_candidate(self, ctx: ScanContext, active: set[str]) -> None:
-        """Прогон набора-кандидата вхолостую (M7.2).
+    def _match_candidate(
+        self, candidate: Any, ctx: ScanContext, part: str, data: bytes | None, found: set[str]
+    ) -> bool:
+        """Прогон набора-кандидата вхолостую (M7.2). False — кандидат упал.
 
         Совпадения кандидата НЕ попадают ни в признаки, ни в `engines`, ни
         в кэш. Это не осторожность, а определение: набор, способный изменить
@@ -333,19 +353,16 @@ class YaraStage(Stage):
         Отсюда и обработка ошибок: что бы кандидат ни сделал, проверка файла
         уже состоялась, и портить её результат нельзя.
         """
-        candidate = self._candidate
-        if candidate is None:
-            return
-
         try:
             with self._lock:
-                matches = candidate.match(str(ctx.path), timeout=int(STAGE_TIMEOUT_S["yara"]))
-            found = {match.rule for match in matches}
+                found.update(match.rule for match in _match(candidate, ctx.path, part, data))
         except Exception:
             logger.warning("набор-кандидат не отработал на файле", exc_info=True)
             metrics().canary_runs.labels(outcome="failed").inc()
-            return
+            return False
+        return True
 
+    def _compare_candidate(self, ctx: ScanContext, active: set[str], found: set[str]) -> None:
         if found == active:
             metrics().canary_runs.labels(outcome="agree").inc()
         else:
@@ -358,3 +375,11 @@ class YaraStage(Stage):
 
         if self._observer is not None and found != active:
             self._observer(ctx.job.sha256, frozenset(active), frozenset(found))
+
+
+def _match(rules: Any, path: Path, part: str, data: bytes | None) -> list[Any]:
+    """Сопоставление одного вида файла: целиком по пути или части из памяти."""
+    timeout = int(STAGE_TIMEOUT_S["yara"])
+    if data is None:
+        return list(rules.match(str(path), externals=EXTERNALS, timeout=timeout))
+    return list(rules.match(data=data, externals={"part": part}, timeout=timeout))

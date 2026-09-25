@@ -72,7 +72,6 @@ def build_policy(base: TenantPolicy, tenant: str, payload: dict[str, object]) ->
     return policy
 
 
-
 class PolicyRegistry:
     def __init__(
         self,
@@ -132,7 +131,27 @@ class PolicyRegistry:
                     raw = json.loads(path.read_text())
                     for tenant, payload in raw.items():
                         overrides[tenant] = build_policy(default, tenant, payload)
-                    logger.info("политики тенантов загружены", extra={"tenants": len(overrides)})
+                    # Приёмники считаем отдельной цифрой, и это не украшение
+                    # строки. «Доставка не настроена» — штатное состояние, оно
+                    # нигде не логируется и ни во что не попадает: воркер
+                    # молча не ставит задание, notifier молча ничего не ждёт,
+                    # бакет остаётся пустым. Отличить это от поломки можно
+                    # было только руками через `redis-cli XINFO GROUPS`.
+                    #
+                    # Ноль здесь при настроенном приёмнике означает ровно одно:
+                    # блок `delivery` лежит не у того тенанта. Так уже было
+                    # дважды — политику заводили под идентификатор ключа
+                    # (`telegram-bot-1`) вместо имени тенанта.
+                    with_delivery = sum(1 for p in overrides.values() if p.delivery is not None)
+                    broken = sum(1 for p in overrides.values() if p.delivery_error)
+                    logger.info(
+                        "политики тенантов загружены",
+                        extra={
+                            "tenants": len(overrides),
+                            "с_приёмником": with_delivery,
+                            "приёмник_негоден": broken,
+                        },
+                    )
                 except Exception:
                     degraded = True
                     overrides.clear()

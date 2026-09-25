@@ -15,17 +15,21 @@
 
 from .client import (
     CallbackVerificationError,
+    CleanCopy,
     ScanOutcome,
     VulnscanClient,
     VulnscanError,
+    resolve_ca_file,
     verify_callback,
 )
 
 __all__ = [
     "CallbackVerificationError",
+    "CleanCopy",
     "ScanOutcome",
     "VulnscanClient",
     "VulnscanError",
+    "resolve_ca_file",
     "verify_callback",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

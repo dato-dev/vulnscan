@@ -15,7 +15,7 @@ GREETING = (
     "собирается заново, поэтому в нём не остаётся ни скрытых элементов, ни "
     "сценариев, ни служебных данных о том, кто и чем его создал. Текст и "
     "изображения сохраняются.\n\n"
-    "Поддерживаются PDF, JPEG и PNG."
+    "Поддерживаются PDF, документы Word (DOCX), JPEG, PNG и ZIP-архивы с ними."
 )
 
 COPY_NOTE = "Это пересобранная копия, оригинал не пересылаю."
@@ -40,7 +40,7 @@ ENCRYPTED = (
 
 UNSUPPORTED = (
     "⚠️ Такой формат я проверять не умею, поэтому не пропускаю.\n\n"
-    "Пока поддерживаются PDF, JPEG и PNG."
+    "Пока поддерживаются PDF, документы Word (DOCX), JPEG, PNG и ZIP-архивы с ними."
 )
 
 UNAVAILABLE = (
@@ -59,8 +59,40 @@ _CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("PDF_JAVASCRIPT", "PDF_JS", "PDF_OPENACTION", "PDF_AUTO_ACTION", "PDF_LAUNCH"),
     ),
     (
+        "макросы или программные элементы в документе Word",
+        ("DOCX_VBA", "DOCX_ACTIVEX", "DOCX_DDE", "DOCX_FIELD_OBFUSCATED"),
+    ),
+    (
+        "документ загружает что-то из сети при открытии",
+        (
+            "DOCX_EXTERNAL_TEMPLATE",
+            "DOCX_EXTERNAL_OBJECT",
+            "DOCX_EXTERNAL_LINK",
+            "DOCX_FIELD_INCLUDE",
+        ),
+    ),
+    (
+        "в архиве есть программы или ярлыки",
+        ("ARCHIVE_EXECUTABLE",),
+    ),
+    (
+        "архив, который разворачивается в огромный объём",
+        ("ARCHIVE_BOMB",),
+    ),
+    (
+        "архив устроен так, чтобы записать файлы мимо папки распаковки",
+        ("ARCHIVE_PATH_TRAVERSAL", "ARCHIVE_SYMLINK"),
+    ),
+    (
         "вложенный внутрь файл",
-        ("PDF_EMBEDDED_FILE", "PDF_EMBEDDED_NAMES", "PDF_EMBEDDED_EXECUTABLE"),
+        (
+            "PDF_EMBEDDED_FILE",
+            "PDF_EMBEDDED_NAMES",
+            "PDF_EMBEDDED_EXECUTABLE",
+            "DOCX_OLE_OBJECT",
+            "DOCX_EMBEDDED",
+            "DOCX_ALTCHUNK",
+        ),
     ),
     (
         "интерактивные элементы с действиями",
@@ -83,6 +115,9 @@ _CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
             "PDF_XREF_RECONSTRUCTED",
             "PDF_STREAM_LENGTH_MISMATCH",
             "IMG_MALFORMED",
+            "ARCHIVE_MALFORMED",
+            "DOCX_MALFORMED",
+            "DOCX_DTD",
         ),
     ),
     (
@@ -110,8 +145,12 @@ _CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("TYPE_UNKNOWN", "TYPE_UNSUPPORTED"),
     ),
     (
+        "архив проверен не целиком",
+        ("ARCHIVE_INCOMPLETE",),
+    ),
+    (
         "файл защищён паролем",
-        ("PDF_ENCRYPTED", "PDF_ENCRYPTED_OWNER"),
+        ("PDF_ENCRYPTED", "PDF_ENCRYPTED_OWNER", "ARCHIVE_ENCRYPTED"),
     ),
     (
         "непривычно устроенное содержимое",

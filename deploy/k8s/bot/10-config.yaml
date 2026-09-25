@@ -1,0 +1,31 @@
+# Своё окружение, а не общий `vulnscan-env`.
+#
+# Дело не только в том, что ConfigMap не пересекает границу namespace.
+# Боту незачем знать адреса Redis, S3 и базы: он клиент, и его дело — HTTP к
+# gateway. Копировать сюда общий набор значило бы раздать интегратору карту
+# внутренностей сервиса.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bot-env
+  namespace: vulnscan-bot
+data:
+  LOG_FORMAT: json
+  LOG_LEVEL: INFO
+
+  # Полное имя: gateway живёт в другом namespace, короткое `gateway` здесь не
+  # резолвится.
+  SCANNER_URL: http://gateway.vulnscan.svc:8080
+  TENANT: telegram-bot
+
+  # Адрес, на который сканер пришлёт результат. ИМЯ NAMESPACE ВХОДИТ СЮДА, и
+  # оно же должно быть в `callback_hosts` ключа — см. заголовок kustomization.
+  WEBHOOK_URL: http://bot.vulnscan-bot.svc:8090/webhooks/vulnscan
+
+  METRICS_ENABLED: "true"
+  METRICS_PORT: "9102"
+  WAIT_MS: "2000"
+
+  # Внутренние адреса мимо прокси. Без этого запрос к gateway ушёл бы наружу и
+  # не вернулся: прокси про сеть кластера ничего не знает.
+  NO_PROXY: localhost,127.0.0.1,.svc,.svc.cluster.local,.cluster.local,10.42.0.0/16,10.43.0.0/16

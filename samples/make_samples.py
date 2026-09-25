@@ -71,6 +71,36 @@ def main() -> int:
     except ImportError:
         print("Pillow недоступен, polyglot.jpg пропущен")
 
+    # Документы Word и архивы (M6): по одному механизму на файл.
+    import office_samples
+
+    for name in (
+        "clean_docx",
+        "macro_docm",
+        "dde_docx",
+        "obfuscated_field_docx",
+        "remote_template_docx",
+        "remote_object_docx",
+        "embedded_ole_docx",
+        "altchunk_docx",
+        "dtd_docx",
+        "equation_editor_docx",
+        "docvar_payload_docm",
+    ):
+        suffix = ".docm" if name.endswith("docm") else ".docx"
+        (OUT / f"{name.rsplit('_', 1)[0]}{suffix}").write_bytes(getattr(office_samples, name)())
+    (OUT / "zip_with_launch_pdf.zip").write_bytes(
+        office_samples.zip_of({"invoice.pdf": (OUT / "pdf_launch.pdf").read_bytes()})
+    )
+    (OUT / "zip_bomb_declared.zip").write_bytes(
+        office_samples.with_declared_size(
+            office_samples.zip_of({"a.bin": b"1", "b.bin": b"2", "c.bin": b"3"}), 3_500_000_000
+        )
+    )
+    (OUT / "zip_traversal.zip").write_bytes(
+        office_samples.zip_of({"../../evil.pdf": (OUT / "benign.pdf").read_bytes()})
+    )
+
     for path in sorted(OUT.iterdir()):
         print(f"{path.name}: {path.stat().st_size} байт")
     return 0

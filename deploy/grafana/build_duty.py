@@ -8,11 +8,19 @@ M10.14 требует панель на каждый алерт, и единст
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "packages"))
+
+from vscommon.models import UNSCANNABLE_VERDICTS  # noqa: E402
+
+GRID = 24
+"""Ширина сетки Grafana в колонках. Панель за её краем не падает с ошибкой —
+Grafana молча переносит её, и верхняя строка перестаёт читаться как строка."""
 
 RULES = ROOT / "deploy/lgtp/prometheus/rules"
 OUT = ROOT / "deploy/grafana/dashboards/vulnscan-duty.json"
@@ -126,6 +134,14 @@ def status_panels(pid: int, y: int) -> tuple[list[dict], int]:
             None,
         ),
     ]
+    # Ширина делится на число плашек, остаток раздаётся первым. Было
+    # `w=6, x=6*i`: пока плашек было четыре, это совпадало с сеткой; пятая
+    # («Целей не отвечает») встала в x=24, то есть за край, — и никто не
+    # заметил, потому что Grafana такую панель не отвергает, а переносит.
+    base, extra = divmod(GRID, len(specs))
+    widths = [base + (1 if i < extra else 0) for i in range(len(specs))]
+    offsets = [sum(widths[:i]) for i in range(len(specs))]
+
     panels = []
     for i, (title, expr, desc, mapping) in enumerate(specs):
         field: dict = {
@@ -158,7 +174,7 @@ def status_panels(pid: int, y: int) -> tuple[list[dict], int]:
                 "title": title,
                 "description": desc,
                 "datasource": PROM,
-                "gridPos": {"h": 5, "w": 6, "x": 6 * i, "y": y},
+                "gridPos": {"h": 5, "w": widths[i], "x": offsets[i], "y": y},
                 "targets": [{"refId": "A", "expr": expr}],
                 "fieldConfig": field,
                 "options": {
@@ -169,6 +185,60 @@ def status_panels(pid: int, y: int) -> tuple[list[dict], int]:
             }
         )
     return panels, pid + len(specs)
+
+
+def unscannable_panel(pid: int, y: int) -> dict:
+    """Доля файлов, которые не проверены вовсе (M10.2).
+
+    Выражение собирается из `UNSCANNABLE_VERDICTS`, а не пишется руками:
+    появится новый непроверяемый вердикт — он окажется на панели сам, а не
+    останется за её пределами до первого разбора.
+    """
+    verdicts = "|".join(sorted(v.value for v in UNSCANNABLE_VERDICTS))
+    expr = (
+        f'sum by (verdict) (rate(vs_scans_total{{verdict=~"{verdicts}"}}[$__rate_interval]))'
+        " / ignoring(verdict) group_left"
+        " clamp_min(sum(rate(vs_scans_total[$__rate_interval])), 0.001)"
+    )
+    return {
+        "id": pid,
+        "type": "timeseries",
+        "title": "Доля непроверенного",
+        "description": (
+            "Файлы, содержимое которых проверить невозможно: `unsupported` — "
+            "формат не поддерживается, `encrypted` — защищён паролем. Сервис при "
+            "этом отвечает штатно: коды 200, ошибок нет. Поэтому рост этой доли "
+            "— единственный видимый признак того, что проверка перестала "
+            "происходить.\n\n"
+            "Две причины роста выглядят одинаково, и различать их надо сразу. "
+            "Клиенты начали присылать новый формат — `unsupported` растёт у "
+            "одного тенанта, `vs_degraded{component=\"libmagic\"}` в нуле. "
+            "Сломалось определение типа — растёт у всех сразу, и обычно "
+            "вместе с деградацией libmagic.\n\n"
+            "Алерта нет намеренно: порог без знания фона либо шумит, либо "
+            "молчит. Нормальную долю берём отсюда же после недели наблюдения "
+            "— и тогда эта панель переедет в раздел алертов."
+        ),
+        "datasource": PROM,
+        "gridPos": {"h": 8, "w": GRID, "x": 0, "y": y},
+        "targets": [{"refId": "A", "expr": expr, "legendFormat": "{{verdict}}"}],
+        "fieldConfig": {
+            "defaults": {
+                "unit": "percentunit",
+                "min": 0,
+                "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 2,
+                    "fillOpacity": 20,
+                    "stacking": {"mode": "normal", "group": "A"},
+                },
+                "noValue": "Нет данных — сканов не было или метрика не собирается",
+                "color": {"mode": "palette-classic"},
+            },
+            "overrides": [],
+        },
+        "options": {"legend": {"displayMode": "list", "placement": "bottom"}},
+    }
 
 
 def build() -> dict:
@@ -203,6 +273,16 @@ def build() -> dict:
             panels.append(panel(rule, x=(i % 2) * 12, y=y + (i // 2) * 7, pid=pid))
             pid += 1
         y += ((len(rules) + 1) // 2) * 7
+
+    # Метрики, у которых алерта ещё нет, но смотреть на них дежурному нужно.
+    # Отдельной строкой, чтобы не путать с разделами алертов: здесь не
+    # «сработало», а «вот как это выглядит, пока мы учимся понимать норму».
+    panels.append(row("Наблюдаем: порог ещё не выбран", y, pid))
+    pid += 1
+    y += 1
+    panels.append(unscannable_panel(pid, y))
+    pid += 1
+    y += 8
 
     return {
         "uid": "vulnscan-duty",

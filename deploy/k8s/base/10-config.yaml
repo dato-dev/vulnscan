@@ -1,0 +1,177 @@
+# Конфигурация: то, что не секрет.
+#
+# Два ConfigMap, и разделены они не по смыслу, а по СПОСОБУ ОБНОВЛЕНИЯ.
+#
+# `vulnscan-env` едет в процесс переменными окружения. Переменные читаются
+# один раз при старте, поэтому правка требует `kubectl rollout restart`.
+#
+# `vulnscan-policies` монтируется ФАЙЛАМИ, и их сервис перечитывает на живую
+# по mtime (`PolicyRegistry`, `WeightTable`). Имя этого ConfigMap намеренно
+# без хеша содержимого: хеш менял бы имя при каждой правке, Deployment считал
+# бы это новой спецификацией и перезапускал поды — то есть горячая
+# перезагрузка, ради которой всё и сделано, никогда бы не срабатывала.
+#
+# Значения перенесены из `deploy/.env`. Чего здесь НЕТ и почему:
+#
+#   IMAGE_NAMESPACE, IMAGE_TAG — в compose ими подставляется образ. В
+#     Kubernetes образ записан в манифесте, а тег меняется оверлеем; отдельная
+#     переменная была бы вторым местом, где живёт одно и то же.
+#   TELEGRAM_TOKEN, DEMO_*, SCANNER_*, PUBLIC_DOMAIN, GATEWAY_PORT — это
+#     клиенты и внешний вход. Первое уехало в оверлей `examples`, второе — в
+#     `httproute.yaml`, где ему и место.
+#   METRICS_PORT — у каждого сервиса свой, задан в его манифесте рядом с
+#     портом контейнера. Общее значение здесь перебивало бы половину из них.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vulnscan-env
+  namespace: vulnscan
+data:
+  # Адреса внутри кластера — по именам Service. `.svc` не сокращаем: в кластере
+  # с несколькими namespace короткое имя резолвится через search-домены, и
+  # ошибка вылезает не сразу, а при первом поде в другом namespace.
+  REDIS_URL: redis://redis.vulnscan.svc:6379/0
+  S3_ENDPOINT: http://minio.vulnscan.svc:9000
+  CLAMD_HOST: clamd.vulnscan.svc
+
+  RAW_BUCKET: vulnscan-raw
+  CLEAN_BUCKET: vulnscan-clean
+
+  # --- поведение ---
+  LOG_FORMAT: json
+  # В `.env` стоит DEBUG. Здесь тоже — но имейте в виду цену: на этом уровне
+  # пишутся тайминги стадий и детали разбора, то есть несколько записей на
+  # каждый файл. Для разбора аварии это то, что нужно; для постоянной работы
+  # под нагрузкой — INFO.
+  LOG_LEVEL: DEBUG
+  DEFAULT_FAIL_MODE: suspicious
+  DEFAULT_CDR_PROFILE: standard
+  DEFAULT_SHADOW_MODE: "false"
+  RELOAD_INTERVAL_S: "30"
+  DEEP_ENABLED: "true"
+  # 1.0 — углублённо проверяется КАЖДЫЙ чистый файл. Это режим измерения
+  # пропусков, а не рабочий: он удваивает нагрузку на разбор. Рабочее
+  # значение — доли процента.
+  DEEP_SAMPLE_RATE: "1.0"
+  WAIT_MS: "2000"
+  CONCURRENCY: "4"
+  # Задаётся ОДИН раз. Наружу открыт приём файлов, значит только true:
+  # выключенная проверка подписи выглядит точно так же, как пройденная.
+  REQUIRE_SIGNATURE: "true"
+  # Доверять X-Forwarded-Proto от Gateway. TLS снимает Gateway, до gateway
+  # запрос доходит по HTTP, и без этой строки uvicorn считает схему `http`
+  # (по умолчанию он верит заголовкам только с 127.0.0.1). Рамка виджета
+  # сравнивает свой Origin (`https://…`) с адресом сервиса (`http://…`),
+  # не находит совпадения — и талон не выдаётся: «ключ сайта недействителен».
+  #
+  # `*`, потому что адрес прокси Cilium в кластере заранее не известен.
+  # Подделать заголовок может только тот, кто достучался до gateway мимо
+  # Gateway, — и выиграет он лишь схему в сравнении Origin, который вне
+  # браузера подделывается и так. После политик (M11.1) таких нет вовсе.
+  # Адрес клиента из X-Forwarded-For gateway ни для чего не использует.
+  FORWARDED_ALLOW_IPS: "*"
+
+  # --- наблюдаемость ---
+  OTEL_ENABLED: "false"
+  OTEL_ENDPOINT: http://otel-collector.observability.svc:4318/v1/traces
+  OTEL_SAMPLE_RATIO: "1.0"
+  METRICS_ENABLED: "false"
+  # Только для меток метрик воркера; gateway берёт тенантов из keys.json.
+  KNOWN_TENANTS: default,telegram-bot,demo-site
+
+  # --- зеркало баз ClamAV ---
+  CVD_UPDATE_INTERVAL_S: "14400"
+  CVD_NAMESERVER: 1.1.1.1
+
+  # --- сроки хранения ---
+  RAW_RETENTION_DAYS: "1"
+  CLEAN_RETENTION_DAYS: "1"
+  KEEP_MALICIOUS_SAMPLES: "false"
+
+  # --- история проверок ---
+  POSTGRES_DB: vulnscan
+  POSTGRES_USER: vulnscan
+  HISTORY_RETENTION_DAYS: "90"
+
+  # --- пути к файлам конфигурации ---
+  POLICY_FILE: /app/config/policies.json
+  WEIGHTS_FILE: /app/config/weights.json
+  KEYS_FILE: /app/secrets/keys.json
+  PYTHONPATH: /app
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vulnscan-policies
+  namespace: vulnscan
+  annotations:
+    # Reloader этот ConfigMap НЕ ТРОГАЕТ, и это принципиально.
+    #
+    # Политики и веса перечитываются на живую по mtime файла
+    # (`PolicyRegistry`, `WeightTable`) — ради этого всё и сделано: правка
+    # порогов не должна ронять приём файлов. Автоперезапуск здесь отменил бы
+    # горячую перезагрузку: вместо неё поды уходили бы в рестарт при каждой
+    # правке политики, и разницы снаружи было бы не видно — кроме коротких
+    # отказов на приёме.
+    #
+    # Ошибка была бы тихой в обе стороны: механизм есть, тесты на него есть, а
+    # работает вместо него совсем другое.
+    reloader.stakater.com/ignore: "true"
+data:
+  # Значения-заглушки. Настоящие кладите из своих файлов:
+  #
+  #   kubectl -n vulnscan create configmap vulnscan-policies \
+  #       --from-file=policies.json=deploy/config/policies.json \
+  #       --from-file=weights.json=deploy/config/weights.json \
+  #       --dry-run=client -o yaml | kubectl apply -f -
+  #
+  # Пустой объект означает «переопределений нет», работают встроенные значения.
+  # Это не то же самое, что отсутствующий файл: тот пишет WARNING при старте.
+  policies.json: |
+    {
+      "telegram-bot": {
+        "fail_mode": "suspicious",
+        "block_threshold": 80,
+        "suspicious_threshold": 30,
+        "default_profile": "standard",
+        "max_wait_ms": 2000,
+        "rate_limit_per_min": 1200,
+        "max_concurrent_scans": 64,
+        "deliver_blocked": "strict",
+        "delivery": {
+          "backend": "s3",
+          "endpoint": "https://storage.yandexcloud.net",
+          "bucket": "vulnscan",
+          "prefix": "telegram-bot-1/",
+          "region": "ru-central1",
+          "credentials_id": "telegram-bot-1",
+          "key_template": "{filename}-Проверено-{verdict}-{sha}{ext}"
+        }
+      },
+      "demo-site": {
+        "fail_mode": "fail-closed",
+        "block_threshold": 80,
+        "suspicious_threshold": 30,
+        "default_profile": "standard",
+        "max_wait_ms": 5000,
+        "shadow_mode": false,
+        "rate_limit_per_min": 300,
+        "max_concurrent_scans": 8,
+        "max_upload_bytes": 16777216,
+        "public_rate_limit_per_min": 30,
+        "public_daily_tickets": 1000,
+        "widget_on_unavailable": "block",
+        "deliver_blocked": "strict"
+        "delivery": {
+          "backend": "s3",
+          "endpoint": "https://storage.yandexcloud.net",
+          "bucket": "vulnscan",
+          "prefix": "telegram-bot-1/",
+          "region": "ru-central1",
+          "credentials_id": "telegram-bot-1",
+          "key_template": "{filename}-Проверено-{verdict}-{sha}{ext}"
+        }
+      }
+    }
+  weights.json: |
+    {}

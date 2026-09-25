@@ -31,21 +31,33 @@ import pytest
 ROOT = Path(__file__).parent.parent
 
 LOCAL_PACKAGES = frozenset(
-    {"vscommon", "gateway_app", "worker_app", "botapp", "writerapp", "notifierapp"}
+    {
+        "vscommon",
+        "vulnscan_client",
+        "gateway_app",
+        "worker_app",
+        "botapp",
+        "writerapp",
+        "notifierapp",
+        "feedbackapp",
+    }
 )
 """Наши пакеты: по ним граф идёт вглубь, чужие — записываются и не раскрываются."""
 
 SEARCH_PATHS = [
     ROOT / "packages",
-    *(ROOT / "services" / name for name in ("gateway", "worker", "bot", "writer", "notifier")),
+    *(ROOT / "services" / name for name in ("gateway", "worker", "writer", "notifier")),
+    ROOT / "examples" / "telegram-bot",
+    ROOT / "examples" / "feedbackbot",
 ]
 
 SERVICES = {
     "gateway": ("gateway_app.main", "services/gateway/Dockerfile"),
     "worker": ("worker_app.main", "services/worker/Dockerfile"),
-    "bot": ("botapp.main", "services/bot/Dockerfile"),
+    "bot": ("botapp.main", "examples/telegram-bot/Dockerfile"),
     "writer": ("writerapp.main", "services/writer/Dockerfile"),
     "notifier": ("notifierapp.main", "services/notifier/Dockerfile"),
+    "feedbackbot": ("feedbackapp.main", "examples/feedbackbot/Dockerfile"),
 }
 
 

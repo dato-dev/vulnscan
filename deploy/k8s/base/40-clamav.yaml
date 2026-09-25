@@ -1,0 +1,404 @@
+# Антивирус и зеркало его баз.
+#
+# clamd — StatefulSet не ради идентичности, а из-за цены холодного старта: без
+# сохранённых баз каждый перезапуск это минуты и поход в зеркало.
+#
+# cvdmirror — СТРОГО одна реплика. Ограничение внешнее: CDN ClamAV банит за
+# частые скачивания, ради чего зеркало и заводилось. Две реплики качают одно и
+# то же и ловят бан на двоих.
+apiVersion: v1
+kind: Service
+metadata:
+  name: clamd
+  namespace: vulnscan
+  labels:
+    app: clamd
+spec:
+  clusterIP: None
+  selector:
+    app: clamd
+  ports:
+    - name: clamd
+      port: 3310
+      targetPort: clamd
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  annotations:
+    # Перезапуск при изменении ConfigMap и Secret, на которые ссылается этот
+    # объект (Stakater Reloader). Нужен он ровно там, где обновление не
+    # доезжает само: секреты, смонтированные через `subPath`, обновлений НЕ
+    # получают вовсе, а переменные окружения читаются один раз при старте.
+    #
+    # ConfigMap с политиками из этого исключён — см. `10-config.yaml`.
+    reloader.stakater.com/auto: "true"
+  name: clamd
+  namespace: vulnscan
+spec:
+  serviceName: clamd
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clamd
+  template:
+    metadata:
+      labels:
+        app: clamd
+    spec:
+      serviceAccountName: clamd
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # uid образа clamav/clamav.
+        runAsUser: 100
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Базы кладутся на том ИЗ ОБРАЗА, один раз.
+        #
+        # Официальный образ ClamAV несёт в себе main/daily/bytecode — около
+        # 107 МБ, обычно недельной свежести. Пустой PVC, смонтированный на
+        # /var/lib/clamav, их закрывает: снаружи это выглядит так, будто
+        # антивирус «долго стартует», а на деле он ждёт, пока freshclam скачает
+        # то, что уже лежало в образе.
+        #
+        # Дальше начинается цепочка: зеркало ещё качает базы из интернета и
+        # отдаёт 404, freshclam повторяет, clamd не поднимается, проба не
+        # проходит, под перезапускается — и всё сначала.
+        #
+        # С этим шагом clamd стартует сразу и работает с базами из образа, а
+        # обновление приезжает потом, когда зеркало наполнится. Устаревшие
+        # базы у нас и так видны: `/readyz` отдаёт их возраст, а метрика
+        # `vs_rules_age_seconds` показывает его на графике.
+        - name: seed-databases
+          image: clamav/clamav:1.4
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              if [ -f /target/main.cvd ]; then
+                echo "базы на томе уже есть, ничего не делаю"
+                exit 0
+              fi
+              cp /var/lib/clamav/*.cvd /target/
+              echo "базы из образа положены на том:"
+              ls -la /target
+          volumeMounts:
+            - name: db
+              mountPath: /target
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      containers:
+        - name: clamd
+          image: clamav/clamav:1.4
+          # ЗАПУСК НЕ ЧЕРЕЗ ШТАТНЫЙ ENTRYPOINT, и это не прихоть.
+          #
+          # `/init` первым делом делает `chown -R clamav:clamav /var/lib/clamav`
+          # — «на случай, если это смонтированный том». Под non-root без
+          # CAP_CHOWN это `Operation not permitted`, а скрипт идёт с `set -e`,
+          # поэтому под не стартует вовсе.
+          #
+          # Владельца тома здесь и так выставляет `fsGroup`, так что chown
+          # лишний. Образ это предусматривает: `/init-unprivileged` — тот же
+          # скрипт без chown и без правки конфигов через sed.
+          #
+          # Что теряется: настройка clamd.conf и freshclam.conf переменными
+          # `CLAMD_CONF_*`/`FRESHCLAM_CONF_*`. Нам они не нужны — freshclam.conf
+          # монтируется файлом целиком.
+          command: ["/init-unprivileged"]
+          ports:
+            - name: clamd
+              containerPort: 3310
+          env:
+            - name: CLAMAV_NO_FRESHCLAMD
+              value: "false"
+          volumeMounts:
+            - name: db
+              mountPath: /var/lib/clamav
+            # Отдельный файл, а не каталог: /etc/clamav принадлежит образу,
+            # там же лежит clamd.conf, и подменять весь каталог нельзя.
+            - name: freshclam
+              mountPath: /etc/clamav/freshclam.conf
+              subPath: freshclam.conf
+              readOnly: true
+            - name: run
+              mountPath: /run
+            # clamd пишет в `/var/log/clamav/clamd.log`, freshclam — в
+            # `freshclam.log` рядом (пути заданы в конфигурации образа, а
+            # clamd.conf мы не подменяем). С корнем только для чтения каталог
+            # недоступен, и ClamAV при недоступном журнале НЕ СТАРТУЕТ —
+            # сообщение «Can't initialize the internal logger», после которого
+            # нет ни сокета, ни ответа на пробу.
+            #
+            # Журнал эфемерный: читать его надо через `kubectl logs`, а файл
+            # нужен лишь потому, что без него процесс не поднимается.
+            - name: logs
+              mountPath: /var/log/clamav
+            # Сокет clamd лежит ЗДЕСЬ — `LocalSocket /tmp/clamd.sock` в
+            # конфигурации образа. Без тома на /tmp с корнем только для чтения
+            # clamd не поднимет сокет, freshclam не сможет его уведомить, а в
+            # логе будет только «Can't connect to clamd».
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            # Чужой образ: freshclam пишет в /run и /tmp, они вынесены в
+            # emptyDir выше. Если ваш тег образа пишет ещё куда-то, под не
+            # стартует — это видно сразу, в отличие от ослабления периметра.
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            # Памяти нужно много: clamd держит сигнатуры в ней целиком.
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          startupProbe:
+            # Холодный старт — это не «clamd медленно поднимается». Порядок
+            # такой: сначала freshclam качает базы, и ТОЛЬКО ПОТОМ стартует
+            # clamd. Пока баз нет, сокета нет тоже, и проба честно сообщает
+            # «Could not connect to clamd on LocalSocket /tmp/clamd.sock».
+            #
+            # То есть отказ пробы здесь — обычно не про clamd, а про то, что
+            # зеркало не отдало базы. Смотреть надо в cvdmirror.
+            #
+            # 30 минут: первая закачка на пустой том это ~200 МБ, а зеркало в
+            # этот момент может само ещё качать их из интернета. Прежние
+            # 10 минут превращали медленный первый старт в CrashLoopBackOff,
+            # после которого всё начиналось заново — и так по кругу.
+            exec:
+              command:
+                - clamdscan
+                - --ping
+                - "1"
+            periodSeconds: 10
+            failureThreshold: 180
+          livenessProbe:
+            exec:
+              command:
+                - clamdscan
+                - --ping
+                - "1"
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - clamdscan
+                - --ping
+                - "1"
+            periodSeconds: 15
+            timeoutSeconds: 10
+      volumes:
+        - name: freshclam
+          configMap:
+            name: vulnscan-freshclam
+            defaultMode: 0444
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        - name: logs
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+        # Тома `db` здесь быть НЕ ДОЛЖНО: он объявлен ниже через
+        # volumeClaimTemplates. Имя, объявленное в обоих местах, разрешается в
+        # пользу `volumes` — PVC создаётся, под его не видит, и базы пропадают
+        # при каждом перезапуске. Снаружи это выглядит как медленный старт, а
+        # не как потеря тома.
+  volumeClaimTemplates:
+    - metadata:
+        name: db
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 4Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vulnscan-freshclam
+  namespace: vulnscan
+data:
+  # Копия `deploy/config/freshclam.conf` — того же файла, что монтируется в
+  # compose. Отличается ОДНОЙ строкой: адресом зеркала, он в кластере другой.
+  #
+  # Копия сверяется тестом (`tests/test_k8s_manifests.py`). Первая версия была
+  # написана здесь заново, по памяти, и разъехалась с оригиналом сразу в трёх
+  # местах: без схемы в адресе (freshclam молча пошёл по https на порт
+  # HTTP-зеркала), без `DNSDatabaseInfo no` (TXT-запрос, который внутри сети
+  # некому обслужить) и с `Foreground true` вместо `yes`.
+  freshclam.conf: |
+    # freshclam ходит только во внутреннее зеркало.
+    #
+    # Прямой доступ к database.clamav.net не нужен и не используется: их CDN
+    # ограничивает частоту, а в некоторых сетях он попросту недоступен. Наружу
+    # за базами ходит один cvdmirror, clamd берёт всё у него.
+
+    DatabaseDirectory /var/lib/clamav
+    # Схема ОБЯЗАТЕЛЬНА. Без неё freshclam подставляет https, идёт по нему на
+    # порт простого HTTP и получает «Could not connect to server» — сообщение,
+    # по которому не догадаться, что дело в схеме.
+    DatabaseMirror http://cvdmirror.vulnscan.svc:8000
+
+    # Проверка версии через TXT-запись здесь не нужна: её делает зеркало, а у
+    # нас внутри сети её было бы некому обслужить.
+    DNSDatabaseInfo no
+
+    # Инкрементальные патчи выключены: во внутренней сети трафик бесплатный, а
+    # полный файл исключает целый класс ошибок со сборкой базы из кусков.
+    ScriptedUpdates no
+
+    # Раз в час. Дешёво: зеркало рядом, и это не нагружает чужой CDN.
+    Checks 24
+
+    LogTime yes
+    LogVerbose no
+    Foreground yes
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cvdmirror
+  namespace: vulnscan
+  labels:
+    app: cvdmirror
+spec:
+  clusterIP: None
+  selector:
+    app: cvdmirror
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+    - name: metrics
+      port: 9104
+      targetPort: metrics
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  annotations:
+    # Перезапуск при изменении ConfigMap и Secret, на которые ссылается этот
+    # объект (Stakater Reloader). Нужен он ровно там, где обновление не
+    # доезжает само: секреты, смонтированные через `subPath`, обновлений НЕ
+    # получают вовсе, а переменные окружения читаются один раз при старте.
+    #
+    # ConfigMap с политиками из этого исключён — см. `10-config.yaml`.
+    reloader.stakater.com/auto: "true"
+  name: cvdmirror
+  namespace: vulnscan
+spec:
+  serviceName: cvdmirror
+  # СТРОГО 1. См. заголовок файла: это внешнее ограничение CDN, а не настройка.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cvdmirror
+  template:
+    metadata:
+      labels:
+        app: cvdmirror
+    spec:
+      serviceAccountName: cvdmirror
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cvdmirror
+          image: dato1/vulnscantg-cvdmirror:v1.0.1
+          ports:
+            - name: http
+              containerPort: 8000
+            - name: metrics
+              containerPort: 9104
+          env:
+            - name: IMAGE_TAG
+              value: latest
+            - name: CVD_DB_DIR
+              value: /db
+            - name: CVD_PORT
+              value: "8000"
+            - name: METRICS_PORT
+              value: "9104"
+            # Раз в четыре часа. ClamAV просит не чаще раза в час; с запасом.
+            - name: CVD_UPDATE_INTERVAL_S
+              value: "14400"
+            # Резолвер задаётся явно: cvdupdate спрашивает TXT-запись, чтобы
+            # понять, нужно ли качать. Там, где системный DNS подменяют, ответ
+            # приходит битым — и дальше следует бан за скачивание целиком.
+            - name: CVD_NAMESERVER
+              value: 1.1.1.1
+          volumeMounts:
+            - name: db
+              mountPath: /db
+            - name: tmp
+              mountPath: /tmp
+            # `cvdupdate` держит свою конфигурацию и журнал в домашнем каталоге
+            # (`~/.cvdupdate`) и создаёт его при первом запуске. С корнем
+            # только для чтения это `OSError: Read-only file system`, и падает
+            # оно на `cvd config set` — то есть до первой полезной работы.
+            #
+            # Каталог эфемерный намеренно: `entrypoint.sh` пересоздаёт
+            # конфигурацию при каждом старте, хранить её между перезапусками
+            # незачем. В `/db` его класть нельзя — этот каталог зеркало
+            # раздаёт наружу по HTTP.
+            - name: home
+              mountPath: /home/cvd
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: home
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi
+  volumeClaimTemplates:
+    - metadata:
+        name: db
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 4Gi

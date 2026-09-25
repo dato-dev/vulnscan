@@ -1,7 +1,8 @@
 # vulnscantg
 
 Подключаемый по API сервис для сервисов, принимающих документы от пользователей:
-получает PDF и изображения, **обезвреживает их (CDR)** и возвращает вердикт.
+получает PDF, документы Word, изображения и архивы с ними, **обезвреживает их (CDR)**
+и возвращает вердикт.
 Основной результат — безопасный пересобранный файл, а не только «чисто/грязно».
 
 ```mermaid
@@ -59,7 +60,9 @@ PDF с `/OpenAction` + JavaScript, PDF с `/Launch`, EICAR и polyglot JPEG+ZIP.
 | `services/notifier` | доставка результата клиенту, подпись ключом тенанта |
 | `services/writer` | история проверок в PostgreSQL; единственный с доступом к БД |
 | `services/cvdmirror` | локальное зеркало баз ClamAV |
-| `services/bot` | Telegram-бот: вложение → сканер → обезвреженная копия |
+| `examples/telegram-bot` | Telegram-бот: вложение → сканер → обезвреженная копия |
+| `examples/feedbackbot` | Telegram-бот-форма: ФИО и файл, копия уходит в S3 владельца |
+| `examples/feedback-site` | сайт с формой: подключение через SDK и через виджет |
 | `services/worker/worker_app/stages` | `filetype_detect`, `pdf_structure` — разбор форматов |
 | `packages/vscommon` | модели API, Risk Engine, кэш, логирование, хранилище, очередь, подпись |
 | `rules/yara` | собственные YARA-правила |

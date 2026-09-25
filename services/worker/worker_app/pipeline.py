@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from vscommon.hashing import sha256_bytes, short
-from vscommon.limits import CDR_TIMEOUT_S, STAGE_TIMEOUT_S
+from vscommon.limits import CDR_TIMEOUT_S, MAX_ARCHIVE_DEPTH, STAGE_TIMEOUT_S
 from vscommon.metrics import metrics
 from vscommon.models import (
     UNSCANNABLE_VERDICTS,
@@ -31,11 +31,13 @@ from vscommon.storage import ObjectStore
 from vscommon.telemetry import span
 from vscommon.weights import WeightTable
 
+from . import archive
 from .cdr.base import SanitizeError
 from .cdr.registry import sanitize
 from .config import settings
 from .failure import RISKY_STAGES
 from .scoring import apply_failure, should_stop_early, verdict_of
+from .stages.archive_structure import mark_incomplete
 from .stages.base import ScanContext, Stage
 from .stages.clamav import ClamavStage
 from .stages.filetype import FiletypeStage
@@ -306,6 +308,7 @@ class Pipeline:
                 weights=self._weights.with_overrides(job.policy.weight_overrides),
             )
             await self._run_stages(ctx, timings, job, on_stage)
+            await self._expand(ctx, timings, job, on_stage)
 
             verdict, score = verdict_of(ctx, job.policy)
             # Снятие блокировки — ДО решения о пересборке: заблокированный файл
@@ -412,6 +415,93 @@ class Pipeline:
                     "ранний выход: порог блокировки достигнут", extra={"stage": stage.name}
                 )
                 return
+
+    async def _expand(
+        self,
+        ctx: ScanContext,
+        timings: list[StageTiming],
+        job: ScanJob,
+        on_stage: StageReporter | None,
+    ) -> None:
+        """Проверка вложений архива: полный проход стадий на каждую запись.
+
+        Вложение проверяется так же, как загруженный файл: антивирус и YARA
+        по сжатому архиву видят только сжатые байты. Признаки вложения
+        переносятся на архив (`ScanContext.adopt`) — так ZIP с вредоносным PDF
+        внутри не получает `clean` (M6.2).
+
+        Рекурсия ограничена явно: глубже `MAX_ARCHIVE_DEPTH` опись не отдаёт
+        записей, и сюда же стоит своя проверка — на случай, если опись
+        когда-нибудь об этом забудет.
+        """
+        if not ctx.members or ctx.budget is None or ctx.depth > MAX_ARCHIVE_DEPTH:
+            return
+        if on_stage is not None:
+            # До распаковки: разжимает её zlib, то есть C-код на чужих данных.
+            await on_stage("archive")
+
+        started = time.perf_counter()
+        with span("archive", members=len(ctx.members), depth=ctx.depth):
+            await self._scan_members(ctx, job, on_stage)
+        if ctx.depth == 0:
+            timings.append(
+                StageTiming(
+                    stage="archive",
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                    ok="archive" not in ctx.failed_stages,
+                )
+            )
+
+    async def _scan_members(
+        self, ctx: ScanContext, job: ScanJob, on_stage: StageReporter | None
+    ) -> None:
+        budget = ctx.budget
+        assert budget is not None
+        # Заявленные клиентом тип и расширение — про архив, а не про его
+        # содержимое. Перенесённые на вложение, они давали бы ложное
+        # «расширение не совпадает» на каждом файле внутри.
+        member_job = job.model_copy(
+            update={"filename_ext": None, "declared_mime": None, "cached": None}
+        )
+        base = Path(tempfile.mkdtemp(dir=ctx.path.parent, prefix=f"members-{ctx.depth}-"))
+        try:
+            for member in ctx.members:
+                if not job.deep and should_stop_early(ctx, job.policy):
+                    # Архив уже блокируется: остальное не изменит вердикта.
+                    return
+                if budget.expired():
+                    mark_incomplete(ctx, "archive", "время на проверку вложений вышло")
+                    return
+
+                path = base / f"{member.index:05d}.bin"
+                try:
+                    await asyncio.to_thread(archive.extract, ctx.path, member.info, path, budget)
+                except archive.BudgetExceededError as exc:
+                    mark_incomplete(ctx, "archive", f"вложение {member.label}: {exc}")
+                    return
+                except archive.ArchiveError as exc:
+                    # Не распаковалось — значит, не проверено.
+                    ctx.supported = False
+                    ctx.add("archive", "ARCHIVE_MALFORMED", f"вложение {member.label}: {exc}")
+                    continue
+
+                child = ScanContext(
+                    job=member_job,
+                    path=path,
+                    weights=ctx.weights,
+                    budget=budget,
+                    depth=ctx.depth + 1,
+                )
+                try:
+                    # Тайминги вложений в ответ не идут: у архива на сотню
+                    # файлов список стадий стал бы длиннее самого ответа.
+                    await self._run_stages(child, [], member_job, on_stage)
+                    await self._expand(child, [], member_job, on_stage)
+                finally:
+                    path.unlink(missing_ok=True)
+                ctx.adopt(child, f"вложение {member.label}")
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
 
     @staticmethod
     def _should_sanitize(job: ScanJob, verdict: Verdict) -> bool:
