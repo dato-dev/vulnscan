@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -164,3 +166,82 @@ def _match_signature(head: bytes) -> tuple[str | None, str | None, int]:
 
 def extension_for(mime: str | None) -> str | None:
     return _EXT_BY_MIME.get(mime) if mime else None
+
+
+# --- контейнеры на основе ZIP (M6) ---
+
+ZIP_MIME = "application/zip"
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+DOCM_MIME = "application/vnd.ms-word.document.macroEnabled.12"
+DOCX_MIMES = frozenset({DOCX_MIME, DOCM_MIME})
+
+JAR_MIME = "application/java-archive"
+APK_MIME = "application/vnd.android.package-archive"
+
+_OOXML_MAIN = (
+    ("word/document.xml", DOCX_MIME, ".docx"),
+    (
+        "xl/workbook.xml",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsx",
+    ),
+    (
+        "ppt/presentation.xml",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ".pptx",
+    ),
+)
+
+CONTENT_TYPES_READ_LIMIT = 256 * 1024
+"""Сколько читать из `[Content_Types].xml`, чтобы отличить DOCM от DOCX."""
+
+
+def refine_zip(path: Path) -> tuple[str, str]:
+    """Что за контейнер лежит в ZIP: документ Word, таблица, Java — или просто архив.
+
+    Таблица сигнатур видит у всех них одно и то же `PK\\x03\\x04`, а libmagic
+    может быть недоступен. Без уточнения DOCX проверялся бы как архив из
+    XML-файлов, а JAR — как безобидный архив.
+
+    Читается только центральный каталог и, для Word, начало одной части.
+    Битый архив остаётся `application/zip`: признак о поломке поставит разбор.
+    """
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = set(zf.namelist())
+            if "[Content_Types].xml" in names:
+                for main, mime, ext in _OOXML_MAIN:
+                    if main not in names:
+                        continue
+                    if mime == DOCX_MIME:
+                        with zf.open("[Content_Types].xml") as handle:
+                            types = handle.read(CONTENT_TYPES_READ_LIMIT)
+                        if b"macroEnabled" in types:
+                            return DOCM_MIME, ".docm"
+                    return mime, ext
+            if "mimetype" in names:
+                with zf.open("mimetype") as handle:
+                    declared = handle.read(128).decode("ascii", "replace").strip()
+                if declared.startswith("application/vnd.oasis.opendocument."):
+                    return declared, ".odf"
+            if "AndroidManifest.xml" in names and "classes.dex" in names:
+                return APK_MIME, ".apk"
+            if "META-INF/MANIFEST.MF" in names and any(n.endswith(".class") for n in names):
+                return JAR_MIME, ".jar"
+    except Exception as exc:
+        logger.debug("архив не открылся при уточнении типа", extra={"reason": type(exc).__name__})
+    return ZIP_MIME, ".zip"
+
+
+def sniff(path: Path) -> str | None:
+    """Тип по содержимому без libmagic — для санитайзера, выбирающего обработчик.
+
+    Решение «проверено» принимает конвейер со всеми детекторами; здесь нужно
+    лишь понять, чем пересобирать вложение, которое конвейер уже пропустил.
+    """
+    with path.open("rb") as handle:
+        head = handle.read(HEAD_BYTES)
+    mime, _ext, _offset = _match_signature(head)
+    if mime == ZIP_MIME:
+        mime, _ext = refine_zip(path)
+    return mime

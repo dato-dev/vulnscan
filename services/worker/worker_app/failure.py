@@ -9,13 +9,16 @@ from vscommon.journal import Attempt
 
 logger = logging.getLogger(__name__)
 
-RISKY_STAGES = frozenset({"structure", "yara", "cdr"})
+RISKY_STAGES = frozenset({"structure", "yara", "cdr", "archive"})
 """Стадии, где недоверенный файл попадает в C-код.
 
 pikepdf, Pillow и yara-python могут уронить процесс целиком — не исключением,
 а segfault'ом. Если предыдущая попытка оборвалась на одной из этих стадий,
 причина в самом файле. Стадия `clamav` сюда не входит: разбор идёт в чужом
 процессе, упасть вместе с нами он не может.
+
+`archive` — распаковка вложений (M6): сжатый поток разжимает zlib, то есть
+тоже C-код на недоверенных данных.
 """
 
 

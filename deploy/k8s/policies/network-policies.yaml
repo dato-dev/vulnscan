@@ -1,0 +1,451 @@
+# Сетевая изоляция (M11.1). Перевод `internal: true` из compose.
+#
+# Это самый опасный файл в каталоге. Неверный `image:` роняет под — это видно.
+# Не применившаяся политика не роняет ничего: воркер работает, файлы
+# проверяются, и только выход в интернет у него остался.
+#
+# Порядок — от запрета к разрешению. Начинаем с `default deny` на весь
+# namespace и открываем по одному. Обратный порядок («запретим лишнее»)
+# оставляет дыры, которых не видно.
+#
+# Проверять ЗАПУСКОМ, а не чтением: из пода воркера не должно открываться
+# соединение к внешнему адресу. Отброшенные потоки смотреть в Hubble —
+# он же показывает, что политика реально сработала, а не что трафика не было:
+#
+#   kubectl -n vulnscan exec deploy/worker -- python -c \
+#       "import socket;socket.create_connection(('1.1.1.1',443),3)"
+#   hubble observe --namespace vulnscan --verdict DROPPED
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: default-deny
+  namespace: vulnscan
+spec:
+  endpointSelector: {}
+  # Пустые списки — это именно «ничего нельзя», а не «правил нет». Отсутствие
+  # ключа означало бы обратное.
+  ingress: []
+  egress: []
+---
+# DNS разрешается ЯВНО и всем. Забытый доступ к kube-dns ломает не всё сразу, а
+# выборочно — то, что резолвится по имени, при живых соединениях по IP.
+# Разбирать такое тяжело.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: vulnscan
+spec:
+  endpointSelector: {}
+  egress:
+    # DNS разрешён ПО АДРЕСУ Service и без разбора запросов. Это не первый
+    # вариант, а тот, который работает здесь.
+    #
+    # Красивее было бы по меткам пода CoreDNS (`toEndpoints`) с разбором DNS
+    # (`rules: dns`) — тогда Cilium видит ответы резолвера и умеет `toFQDNs`,
+    # то есть «наружу можно вот к этому имени». Но это требует, чтобы Cilium
+    # подменял kube-proxy: только тогда обращение к ClusterIP транслируется в
+    # адрес пода ДО применения политики. Без замены Cilium видит `10.43.0.10`
+    # как `world`, правило по меткам не совпадает, и DNS не разрешён никому.
+    #
+    # В Hubble это выглядит так:
+    #   clamd-0 <> 10.43.0.10 (world) policy-verdict:none EGRESS DENIED
+    #
+    # Проверить свой кластер:
+    #   kubectl -n kube-system exec ds/cilium -- cilium-dbg status | grep -i kubeproxy
+    #
+    # ВАЖНО: `rules: dns` нельзя ставить рядом с `toCIDRSet`. L7-правила в
+    # Cilium поддерживаются только с `toEndpoints`, и политика с таким
+    # сочетанием отвергается ЦЕЛИКОМ — то есть DNS перестаёт работать совсем,
+    # а причина видна только в `status` объекта:
+    #   kubectl -n vulnscan get cnp allow-dns -o jsonpath='{.status}'
+    #
+    # ПОДСТАВЬТЕ СВОЙ ДИАПАЗОН Service:
+    #   kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}'
+    - toCIDRSet:
+        - cidr: 10.43.0.0/16
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+---
+# Воркер: Redis, объектное хранилище, антивирус, коллектор. Больше ничего.
+#
+# Ни одного `toEntities: world`. Это и есть периметр: дыра в парсере остаётся
+# «упал контейнер» и не превращается в канал наружу.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: worker
+  namespace: vulnscan
+spec:
+  endpointSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - worker
+          - deepscan
+  ingress:
+    # Только скрейп метрик. Никто не инициирует соединение к воркеру.
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: observability
+      toPorts:
+        - ports:
+            - port: "9100"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: redis
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: minio
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: clamd
+      toPorts:
+        - ports:
+            - port: "3310"
+              protocol: TCP
+    # Телеметрия. В compose ради неё воркер подключён к общей сети мониторинга
+    # и изоляция снята — здесь этого делать не нужно: разрешён один адрес и
+    # один порт, а не сеть с выходом наружу.
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: observability
+            app: otel-collector
+      toPorts:
+        - ports:
+            - port: "4318"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: gateway
+  namespace: vulnscan
+spec:
+  endpointSelector:
+    matchLabels:
+      app: gateway
+  ingress:
+    # Трафик приходит через Gateway API. `ingress` — сущность Cilium для его
+    # собственной реализации Gateway API. Если Gateway у вас чужой (Envoy
+    # Gateway, NGINX Gateway Fabric), замените на fromEndpoints с
+    # io.kubernetes.pod.namespace его контроллера — иначе внешний трафик
+    # окажется отброшен, а выглядеть это будет как недоступный сервис.
+    - fromEntities:
+        - ingress
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: observability
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: redis
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: minio
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: observability
+            app: otel-collector
+      toPorts:
+        - ports:
+            - port: "4318"
+              protocol: TCP
+---
+# Notifier ходит наружу по назначению: коллбэки клиентам и выгрузка копий в их
+# хранилища. Это единственный наш сервис с доступом в мир — и он же
+# единственный, кто держит ключи тенантов. Оба свойства у него не случайно:
+# он не разбирает недоверенный контент.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: notifier
+  namespace: vulnscan
+spec:
+  endpointSelector:
+    matchLabels:
+      app: notifier
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: observability
+      toPorts:
+        - ports:
+            - port: "9103"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: redis
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: minio
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: observability
+            app: otel-collector
+      toPorts:
+        - ports:
+            - port: "4318"
+              protocol: TCP
+    # Наружу — только HTTPS. Адреса приёмников и коллбэков задаёт политика
+    # тенанта, заранее их не перечислить. Ограничение по порту здесь всё, что
+    # можно сделать, не зная списка клиентов; сузить до toFQDNs имеет смысл
+    # там, где клиенты известны и меняются редко.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: writer
+  namespace: vulnscan
+spec:
+  endpointSelector:
+    matchLabels:
+      app: writer
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: observability
+      toPorts:
+        - ports:
+            - port: "9101"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            app: redis
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: postgres
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: observability
+            app: otel-collector
+      toPorts:
+        - ports:
+            - port: "4318"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: cvdmirror
+  namespace: vulnscan
+spec:
+  endpointSelector:
+    matchLabels:
+      app: cvdmirror
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app: clamd
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            io.kubernetes.pod.namespace: observability
+      toPorts:
+        - ports:
+            - port: "9104"
+              protocol: TCP
+  egress:
+    # Наружу — только этот под и только HTTPS/HTTP.
+    #
+    # Хотелось ограничить ИМЕНЕМ хоста (`toFQDNs: *.clamav.net`) — ради этого
+    # Cilium здесь и выбирали. Но `toFQDNs` работает лишь тогда, когда DNS
+    # проходит через L7-прокси Cilium, а он требует того же, чего и правило
+    # выше: замены kube-proxy. Без неё запрет выглядит так:
+    #
+    #   cvdmirror-0 <> 151.101.0.223:443 (world) EGRESS DENIED (TCP Flags: SYN)
+    #
+    # — адрес, которого никто не запрещал, просто неизвестный.
+    #
+    # Прописывать адреса CDN руками не надо: у ClamAV это Fastly, адреса
+    # меняются, и список устареет через неделю. Лучше честное «наружу по 443»
+    # у одного пода, чем список, который выглядит строгим и не работает.
+    #
+    # ВЕРНУТЬ ОГРАНИЧЕНИЕ ПО ИМЕНИ, когда в кластере включена замена
+    # kube-proxy: убрать блок `toEntities` ниже и поставить вместо него
+    #
+    #   - toFQDNs:
+    #       - matchName: database.clamav.net
+    #       - matchPattern: "*.clamav.net"
+    #     toPorts:
+    #       - ports:
+    #           - port: "443"
+    #             protocol: TCP
+    #           - port: "80"
+    #             protocol: TCP
+    #
+    # и одновременно вернуть в `allow-dns` вариант с `toEndpoints` и
+    # `rules: dns`. По отдельности они не работают.
+    - toEntities:
+        - world
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "80"
+              protocol: TCP
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: clamd
+  namespace: vulnscan
+spec:
+  endpointSelector:
+    matchLabels:
+      app: clamd
+  ingress:
+    - fromEndpoints:
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - worker
+                - deepscan
+      toPorts:
+        - ports:
+            - port: "3310"
+              protocol: TCP
+  egress:
+    # Только зеркало. Выхода наружу у clamd нет: за базами ходит cvdmirror,
+    # а clamd берёт их у него по внутренней сети. DNS разрешён общей
+    # политикой `allow-dns`, дублировать его здесь не нужно.
+    - toEndpoints:
+        - matchLabels:
+            app: cvdmirror
+      toPorts:
+        - ports:
+            - port: "8000"
+              protocol: TCP
+---
+# Хранилища принимают соединения только от тех, кому положено, и не
+# инициируют своих. Egress пустой намеренно.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: redis
+  namespace: vulnscan
+spec:
+  endpointSelector:
+    matchLabels:
+      app: redis
+  ingress:
+    - fromEndpoints:
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - gateway
+                - worker
+                - deepscan
+                - notifier
+                - writer
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+  egress: []
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: postgres
+  namespace: vulnscan
+spec:
+  endpointSelector:
+    matchLabels:
+      app: postgres
+  ingress:
+    # Только writer. Воркер до базы не достаёт — он разбирает враждебные файлы,
+    # и сетевой доступ к истории из него это лишняя дверь.
+    - fromEndpoints:
+        - matchLabels:
+            app: writer
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+  egress: []
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: minio
+  namespace: vulnscan
+spec:
+  endpointSelector:
+    matchLabels:
+      app: minio
+  ingress:
+    - fromEndpoints:
+        - matchExpressions:
+            - key: app
+              operator: In
+              values:
+                - gateway
+                - worker
+                - deepscan
+                - notifier
+      toPorts:
+        - ports:
+            - port: "9000"
+              protocol: TCP
+  egress: []

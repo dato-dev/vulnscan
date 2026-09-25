@@ -32,6 +32,7 @@ on:
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/e2e.yml"
+      - "deploy/k8s/base/**"
 
   schedule:
     # Раз в сутки. Прогон ловит не только свои изменения: базовые образы,
@@ -52,6 +53,101 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  kubernetes:
+    # Выкат — после зелёного сквозного прогона, а не параллельно с ним:
+    # иначе в кластер уезжает то, что прогон через минуту признает сломанным.
+    needs: delivery
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+    timeout-minutes: 30
+    env:
+      # Версия закреплена: `stable.txt` менял бы клиент от прогона к прогону.
+      # Держите её в пределах одной минорной версии от кластера.
+      KUBECTL_VERSION: ${{ vars.KUBECTL_VERSION || 'v1.33.9' }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Без checkout в рабочем каталоге нет `deploy/k8s/base`.
+          persist-credentials: false
+
+      - name: Проверить есть ли kubectl на ноде
+        # Ставим в каталог раннера, а не в /usr/bin: sudo раннеру не нужен, и
+        # давать его ради одного бинарника — лишнее. Сумма сверяется с
+        # опубликованной рядом: скачанный без проверки бинарник получает
+        # kubeconfig с правами на кластер.
+        run: |
+          set -eu
+          if ! command -v kubectl >/dev/null 2>&1; then
+            dir="$RUNNER_TOOL_CACHE/kubectl/$KUBECTL_VERSION"
+            mkdir -p "$dir"
+            base="https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64"
+            curl -fsSL -o "$dir/kubectl" "$base/kubectl"
+            echo "$(curl -fsSL "$base/kubectl.sha256")  $dir/kubectl" | sha256sum --check
+            chmod +x "$dir/kubectl"
+            echo "$dir" >> "$GITHUB_PATH"
+          fi
+
+      - name: Авторизоваться в кластере
+        # `export` в отдельном шаге до следующего не доживает: каждый шаг —
+        # новый процесс. Переменная передаётся через GITHUB_ENV, а сам
+        # kubeconfig — из секрета во временный файл, который удаляется в конце.
+        env:
+          KUBECONFIG_DATA: ${{ secrets.E2E_KUBECONFIG }}
+        run: |
+          set -eu
+          if [ -z "$KUBECONFIG_DATA" ]; then
+            echo "::error::не задан secrets.E2E_KUBECONFIG"
+            exit 1
+          fi
+          umask 077
+          printf '%s' "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Проверить остался ли namespace от прошлого деплоя
+        # Namespace НЕ удаляется. В нём живут секреты, которых нет в
+        # репозитории (`deploy/k8s/secrets.sh` собирает их из локальных
+        # файлов), и тома с историей проверок и базами антивируса. После
+        # удаления выкат поднял бы поды без ключей, а данные ушли бы безвозвратно.
+        # `apply -k` идемпотентен: существующее обновится, новое создастся.
+        run: |
+          if kubectl get namespace vulnscan >/dev/null 2>&1; then
+            echo "namespace vulnscan есть — обновляем"
+          else
+            echo "namespace vulnscan нет — первая установка; секреты создайте вручную: sh deploy/k8s/secrets.sh"
+          fi
+
+      - name: Задеплоить vulnscan
+        # `-k`, а не `-f`: `-f` по каталогу применил бы и secrets.example.yaml —
+        # заглушки поверх настоящих секретов — и споткнулся бы о
+        # kustomization.yaml, который не объект Kubernetes.
+        run: kubectl apply -k deploy/k8s/base
+
+      - name: Проверить, что все ок
+        # `apply` готовности не ждёт: он возвращается, как только объекты
+        # приняты. Ждём каждый Deployment и StatefulSet. clamd поднимается
+        # долго — у него своя проба запуска на базы.
+        run: |
+          set -eu
+          for resource in $(kubectl -n vulnscan get deployment,statefulset -o name); do
+            kubectl -n vulnscan rollout status "$resource" --timeout=600s
+          done
+          kubectl -n vulnscan get pods -o wide
+
+      - name: Состояние кластера при сбое
+        if: failure()
+        run: |
+          kubectl -n vulnscan get pods -o wide || true
+          kubectl -n vulnscan get events --sort-by=.lastTimestamp | tail -40 || true
+
+      - name: Убрать kubeconfig
+        # Раннер свой и живёт долго: файл с доступом к кластеру не должен
+        # дожидаться следующего прогона.
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kubeconfig"
+
   delivery:
     # ЗАМЕНИТЕ на метки своего раннера, как в security.yml.
     runs-on: [self-hosted, linux, x64]

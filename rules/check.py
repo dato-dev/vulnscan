@@ -37,6 +37,11 @@ from pathlib import Path
 sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != Path(__file__).parent]
 
 ROOT = Path(__file__).resolve().parent.parent
+# Что правило видит в работе, решает воркер (`worker_app.yara_views`), и шлюз
+# обязан видеть то же самое — иначе он проверял бы правила не в тех условиях.
+for extra in (ROOT / "packages", ROOT / "services/worker"):
+    if str(extra) not in sys.path:
+        sys.path.insert(0, str(extra))
 RULES_DIR = ROOT / "rules/yara"
 CORPUS = ROOT / "corpus"
 SAMPLES = ROOT / "samples/generated"
@@ -47,6 +52,11 @@ MUST_MATCH = {
     # файл в samples/generated → правило, которое обязано его заметить
     "pdf_launch.pdf": "pdf_launch_action",
     "pdf_openaction_js.pdf": "pdf_js_with_autoexec",
+    # Правила для Word видят только распакованные части — ровно так, как их
+    # отдаёт стадия. Образец для docvar ещё и сторожит молчаливый предел
+    # YARA на длину повтора в регулярке (см. office.yar).
+    "equation_editor.docx": "docx_equation_editor",
+    "docvar_payload.docm": "docx_docvar_payload",
 }
 """Синтетика, на которой правила обязаны срабатывать.
 
@@ -75,9 +85,26 @@ def compile_rules() -> object:
         print(f"в {RULES_DIR} нет ни одного файла правил", file=sys.stderr)
         raise SystemExit(2)
 
-    compiled = yara.compile(filepaths=sources)
+    from worker_app.yara_views import EXTERNALS
+
+    compiled = yara.compile(filepaths=sources, externals=EXTERNALS)
     print(f"скомпилировано файлов правил: {len(sources)}")
     return compiled
+
+
+def matched(rules: object, path: Path) -> set[str]:
+    """Сработавшие правила — по всем видам файла, как в стадии YARA."""
+    from worker_app.stages.filetype_detect import sniff
+    from worker_app.yara_views import views
+
+    hit: set[str] = set()
+    for part, data in views(path, sniff(path)):
+        if data is None:
+            found = rules.match(str(path), externals={"part": ""})  # type: ignore[attr-defined]
+        else:
+            found = rules.match(data=data, externals={"part": part})  # type: ignore[attr-defined]
+        hit.update(match.rule for match in found)
+    return hit
 
 
 def check_detection(rules: object) -> list[str]:
@@ -88,7 +115,7 @@ def check_detection(rules: object) -> list[str]:
         if not path.exists():
             problems.append(f"{name}: нет файла — сначала `make samples`")
             continue
-        hit = {match.rule for match in rules.match(str(path))}  # type: ignore[attr-defined]
+        hit = matched(rules, path)
         if expected not in hit:
             problems.append(f"{name}: правило {expected} не сработало (сработали: {hit or '—'})")
     return problems
@@ -121,7 +148,7 @@ def check_false_positives(rules: object) -> tuple[list[str], int]:
         if labels.get(path.name) != CLEAN_LABEL:
             continue
         checked += 1
-        hit = {match.rule for match in rules.match(str(path))}  # type: ignore[attr-defined]
+        hit = matched(rules, path)
         if hit and path.name not in expected:
             problems.append(f"{path.name}: {', '.join(sorted(hit))}")
     return problems, checked

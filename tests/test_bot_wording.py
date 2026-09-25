@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services" / "bot"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "telegram-bot"))
 
 from botapp import wording
 from botapp.main import _clean_name

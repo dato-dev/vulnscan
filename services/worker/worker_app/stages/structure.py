@@ -1,7 +1,9 @@
 """S1: структурный анализ. Здесь ловится большинство реальных PDF-атак.
 
 Разбор PDF вынесен в `pdf_structure`: проверок по §8 ТЗ там на отдельный
-модуль. Здесь остаются диспетчеризация по типу и анализ изображений.
+модуль. Так же вынесены архивы (`archive_structure`) и документы Word
+(`docx_structure`). Здесь остаются диспетчеризация по типу и анализ
+изображений.
 """
 
 from __future__ import annotations
@@ -10,8 +12,9 @@ import logging
 
 from vscommon.limits import MAX_IMAGE_PIXELS
 
-from . import pdf_structure
+from . import archive_structure, docx_structure, pdf_structure
 from .base import ScanContext, Stage
+from .filetype_detect import DOCX_MIMES, ZIP_MIME
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,10 @@ class StructureStage(Stage):
     def run(self, ctx: ScanContext) -> None:
         if ctx.detected_mime == "application/pdf":
             self._scan_pdf(ctx)
+        elif ctx.detected_mime == ZIP_MIME:
+            archive_structure.analyse(ctx, self.name)
+        elif ctx.detected_mime in DOCX_MIMES:
+            docx_structure.analyse(ctx, self.name)
         elif ctx.detected_mime and ctx.detected_mime.startswith("image/"):
             self._scan_image(ctx)
 

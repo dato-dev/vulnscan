@@ -152,9 +152,9 @@ def test_alert_rules_are_valid() -> None:
                     continue
                 assert rule.get("for"), f"{name}: нет `for` — сработает на одиночном выбросе"
                 annotations = rule.get("annotations") or {}
-                assert annotations.get("summary") or annotations.get(
-                    "description"
-                ), f"{name}: нечего показать дежурному"
+                assert annotations.get("summary") or annotations.get("description"), (
+                    f"{name}: нечего показать дежурному"
+                )
 
 
 # --- монтируемые файлы --------------------------------------------------
@@ -392,3 +392,103 @@ def test_main_compose_has_no_second_monitoring_stack() -> None:
         f"в основном compose снова появился свой стек наблюдения: {sorted(offenders)}. "
         "Метрики и трейсы собирает стек в deploy/lgtp."
     )
+
+
+# --- дашборд дежурного: генератор и сетка ---------------------------------
+
+
+def _build_duty() -> dict[str, Any]:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "build_duty", ROOT / "deploy/grafana/build_duty.py"
+    )
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build()
+
+
+def test_duty_dashboard_is_what_the_generator_builds() -> None:
+    """Лежащий в репозитории дашборд совпадает с тем, что собирает генератор.
+
+    `build_duty.py` не звал ни один тест и ни одна цель Makefile — то есть это
+    был скрипт, который никто не запускает (CLAUDE.md). Правка JSON руками
+    тихо пропадала бы при следующей сборке, а правка генератора без
+    пересборки — не доезжала бы до Grafana. Обе ошибки выглядят как
+    «панель есть в коде, а на экране её нет».
+
+    Пересобрать: `python deploy/grafana/build_duty.py`.
+    """
+    import json
+
+    on_disk = json.loads((ROOT / "deploy/grafana/dashboards/vulnscan-duty.json").read_text())
+
+    assert _build_duty() == on_disk, (
+        "vulnscan-duty.json разошёлся с build_duty.py — пересоберите генератором"
+    )
+
+
+def test_no_panel_leaves_the_grid() -> None:
+    """Ни одна панель не выходит за правый край сетки Grafana (24 колонки).
+
+    Панель за краем не отвергается — Grafana молча переносит её. Так пятая
+    плашка верхней строки («Целей не отвечает») стояла в x=24: плашек
+    прибавилось, ширина осталась прежней, и строка перестала быть строкой.
+    """
+    import json
+
+    offenders = []
+    for path in sorted((ROOT / "deploy/grafana/dashboards").glob("*.json")):
+        dashboard = json.loads(path.read_text())
+        stack = list(dashboard.get("panels", []))
+        while stack:
+            panel = stack.pop()
+            stack.extend(panel.get("panels", []))
+            grid = panel.get("gridPos", {})
+            if grid.get("x", 0) + grid.get("w", 0) > 24:
+                offenders.append(f"{path.name}: «{panel.get('title')}» x={grid['x']} w={grid['w']}")
+
+    assert not offenders, f"панели за краем сетки: {offenders}"
+
+
+def test_unscannable_share_follows_the_code() -> None:
+    """Панель доли непроверенного знает все непроверяемые вердикты (M10.2).
+
+    `unsupported` и `encrypted` — это файлы, которые не проверены вовсе, а
+    сервис при этом отвечает штатно. Рост их доли — единственный видимый
+    признак того, что проверка перестала происходить. Новый непроверяемый
+    вердикт, не попавший на панель, прятался бы ровно так же, как раньше
+    пряталась сама доля.
+    """
+    from vscommon.models import UNSCANNABLE_VERDICTS
+
+    panel = next(p for p in _duty()["panels"] if p.get("title") == "Доля непроверенного")
+    expr = panel["targets"][0]["expr"]
+
+    assert "vs_scans_total" in expr
+    for verdict in UNSCANNABLE_VERDICTS:
+        assert verdict.value in expr, f"вердикт {verdict.value} выпал из панели"
+    assert panel["fieldConfig"]["defaults"]["unit"] == "percentunit"
+
+
+def test_the_mirror_freshness_is_alerted_on() -> None:
+    """Возраст баз в зеркале стоит под алертом.
+
+    Метрики зеркала заводились в M10.10 и жили без единого правила — то есть
+    существовали только в `/metrics`. Пустое зеркало в кластере при этом
+    отчитывалось нулевым возрастом, и сработать было нечему в двух смыслах
+    сразу. Правило на стороне clamd («БазыАнтивирусаУстарели») замечает то же
+    позже и не говорит, где сломалось.
+    """
+    rules = [
+        rule
+        for path in (LGTP / "prometheus/rules").glob("*.yml")
+        for group in _load(path)["groups"]
+        for rule in group["rules"]
+        if "alert" in rule
+    ]
+
+    watching = [r["alert"] for r in rules if "cvd_mirror_newest_db_age_seconds" in r["expr"]]
+
+    assert watching, "возраст баз в зеркале ни одно правило не смотрит"

@@ -41,5 +41,6 @@ RUN adduser --disabled-password --uid 10001 site && chown -R site:site /app
 USER site
 
 ENV PYTHONPATH=/app PYTHONUNBUFFERED=1
-EXPOSE 8000
+# 8000 — сайт, 9108 — метрики: отдельно, чтобы не открывать их вместе с сайтом.
+EXPOSE 8000 9108
 CMD ["uvicorn", "feedback_site:app", "--host", "0.0.0.0", "--port", "8000"]

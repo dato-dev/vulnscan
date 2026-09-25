@@ -143,7 +143,13 @@ class FakeRules:
     def __init__(self, detector: OverlapDetector) -> None:
         self._detector = detector
 
-    def match(self, path: str, timeout: int = 0) -> list:
+    def match(
+        self,
+        path: str | None = None,
+        timeout: int = 0,
+        externals: dict | None = None,
+        data: bytes | None = None,
+    ) -> list:
         self._detector.enter()
         try:
             for _ in range(500):

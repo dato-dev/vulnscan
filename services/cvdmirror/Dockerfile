@@ -35,6 +35,7 @@ VOLUME ["/db"]
 
 COPY services/cvdmirror/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY services/cvdmirror/exporter.py /usr/local/bin/exporter.py
+COPY services/cvdmirror/probe.py /usr/local/bin/probe.py
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER cvd

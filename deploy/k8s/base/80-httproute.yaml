@@ -1,0 +1,76 @@
+# Внешний вход. Gateway API.
+#
+# Сам Gateway здесь НЕ объявляется намеренно: он общий для кластера, живёт
+# своим жизненным циклом и обычно принадлежит другой команде. Здесь только
+# маршрут к нему.
+#
+# ────────────────────────────────────────────────────────────────────────────
+# ЧТО ПОДСТАВИТЬ В parentRefs
+#
+# Это ссылка на СУЩЕСТВУЮЩИЙ объект Gateway — тот, за которым стоит внешний
+# адрес. Посмотреть, какие есть, и из каких listener'ов они состоят:
+#
+#   kubectl get gateway -A
+#   kubectl get gateway -A -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{range .spec.listeners[*]}    {.name}  {.port}/{.protocol}  {.hostname}{"\n"}{end}{end}'
+#
+#   name         — метаданные .metadata.name того Gateway
+#   namespace    — его .metadata.namespace (можно опустить, если он здесь же)
+#   sectionName  — имя listener'а: .spec.listeners[].name, НЕ протокол и не
+#                  порт. Часто его зовут `https`, но это лишь соглашение.
+#                  Указывать не обязательно — без него маршрут цепляется ко
+#                  всем подходящим listener'ам сразу, включая 80-й порт.
+#
+# ДВЕ ЛОВУШКИ, обе тихие: `kubectl apply` проходит, объект создан, трафика нет.
+#
+# 1. Gateway в другом namespace должен РАЗРЕШИТЬ привязку. У его listener'а
+#    нужно `allowedRoutes.namespaces.from: All` (или `Selector` с меткой
+#    нашего namespace). Иначе маршрут остаётся неприкреплённым с причиной
+#    `NotAllowedByListeners`.
+#
+# 2. `hostnames` ниже должен пересекаться с hostname listener'а. Listener на
+#    `*.abdullin.lab` и маршрут на `scan.abdullin.lab` — пересекаются.
+#    Listener без hostname принимает любые. Непересечение даёт
+#    `NoMatchingListenerHostname`.
+#
+# Проверить, что привязка состоялась, — по статусу, а не по факту создания:
+#
+#   kubectl -n vulnscan get httproute gateway -o jsonpath='{.status.parents[*].conditions[*].type}{"\n"}{.status.parents[*].conditions[*].reason}{"\n"}'
+#
+# Должно быть `Accepted` и `ResolvedRefs` со `reason: Accepted`/`ResolvedRefs`.
+# ────────────────────────────────────────────────────────────────────────────
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: gateway
+  namespace: vulnscan
+spec:
+  parentRefs:
+    - name: vulnscan
+      namespace: gateway
+      sectionName: https
+  hostnames:
+    - scan.abdullin.lab
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v1
+      backendRefs:
+        - name: gateway
+          port: 8080
+      timeouts:
+        # Больше, чем `WAIT_MS`: клиент ждёт синхронный вердикт до этого
+        # предела, и разрыв на стороне Gateway раньше срока превратил бы
+        # штатный `202` в ошибку шлюза.
+        request: 30s
+
+    # Пробы наружу не отдаём: `/readyz` перечисляет состояние зависимостей, и
+    # это карта внутренностей для того, кто смотрит снаружи. Проверки живут
+    # внутри кластера, у kubelet.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /widget
+      backendRefs:
+        - name: gateway
+          port: 8080

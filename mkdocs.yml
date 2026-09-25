@@ -1,0 +1,85 @@
+# Сайт документации на GitHub Pages.
+#
+# Исходники собирает `docs/pages.py` в `build/pages-src`: документация лежит
+# рядом с кодом, а MkDocs читает один каталог. Порядок:
+#
+#   python docs/pages.py && mkdocs build --strict
+#
+# `--strict` обязателен: без него битая ссылка — предупреждение в логе
+# сборки, которое никто не читает, а на сайте — страница «не найдено».
+
+site_name: vulnscantg
+site_description: Проверка и обезвреживание недоверенных файлов (CDR) по API
+repo_url: https://github.com/dato-dev/vulnscan
+repo_name: dato-dev/vulnscan
+edit_uri: ""
+
+docs_dir: build/pages-src
+site_dir: build/pages
+
+theme:
+  name: material
+  language: ru
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Тёмная тема
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Светлая тема
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+      # Якоря как на GitHub — с кириллицей. По умолчанию MkDocs выбрасывает
+      # не-ASCII из якоря, и каждая ссылка вида `#инвентарь` вела бы в никуда.
+      slugify: !!python/object/apply:pymdownx.slugs.slugify
+        kwds:
+          case: lower
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.superfences:
+      # Схемы в документации — только Mermaid (CLAUDE.md), и рисует их тема.
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Обзор: index.md
+  - Подключение:
+      - Руководство: docs/integration.md
+      - API: docs/api.md
+      - Протокол: docs/protocol.md
+      - Библиотека Python: docs/sdk.md
+      - Клиент для Node: packages/vulnscan-client-js/README.md
+  - Примеры:
+      - Сайт с формой: examples/feedback-site/README.md
+      - Бот-форма в Telegram: examples/feedbackbot/README.md
+  - Как устроено:
+      - Архитектура: docs/architecture.md
+      - Политики и профили CDR: docs/policies.md
+      - Справочник признаков: docs/findings.md
+      - Метрики: docs/metrics.md
+  - Выкат:
+      - Сборка образов: docs/deploy.md
+      - Docker Compose: deploy/README.md
+      - Kubernetes: deploy/k8s/README.md
+      - Дашборды: deploy/grafana/README.md
+  - Разработка:
+      - Правила: CLAUDE.md
+      - Корпус и шлюз правил: corpus/README.md
+      - ROADMAP: ROADMAP.md
+      - Идеи: docs/ideas.md

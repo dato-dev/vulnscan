@@ -472,6 +472,61 @@ def test_an_unusable_name_falls_back_to_the_scan_id() -> None:
     assert delivery.object_name("s1", "a" * 64, "clean", ".pdf", 0.0, "...") == "s1.pdf"
 
 
+# --- «приёмник не настроен» видно ------------------------------------------
+
+
+def test_the_log_says_how_many_tenants_have_a_sink(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Число приёмников идёт в лог рядом с числом тенантов.
+
+    «Доставка не настроена» — штатное состояние, и потому оно нигде не
+    отмечается: воркер молча не ставит задание, notifier молча ничего не ждёт,
+    бакет остаётся пустым. На боевой установке отличить это от поломки удалось
+    только через `redis-cli XINFO GROUPS` — по тому, что счётчик группы три
+    часа не двигался.
+
+    Ноль здесь при настроенном приёмнике означает ровно одно: блок `delivery`
+    лежит не у того тенанта. Так уже было дважды.
+    """
+    import json
+    import logging
+
+    from vscommon.config import CommonSettings
+    from vscommon.policy import PolicyRegistry
+
+    path = tmp_path / "policies.json"
+    path.write_text(
+        json.dumps(
+            {
+                "с-приёмником": {
+                    "delivery": {
+                        "bucket": "b",
+                        "credentials_id": "c",
+                        "key_template": "{scan_id}{ext}",
+                    }
+                },
+                "без-приёмника": {"block_threshold": 70},
+                "со-сломанным": {"delivery": {"bucket": "b"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.INFO, logger="vscommon.policy"):
+        PolicyRegistry.load(CommonSettings(policy_file=str(path)))
+
+    loaded = next(r for r in caplog.records if r.msg == "политики тенантов загружены")
+
+    # Через `vars`, а не атрибутами: поля кириллические, и обращение к ним
+    # точкой читается хуже, чем строка, которая уедет в JSON лога.
+    fields = vars(loaded)
+
+    assert fields["tenants"] == 3
+    assert fields["с_приёмником"] == 1
+    assert fields["приёмник_негоден"] == 1
+
+
 # --- отказ доставки виден --------------------------------------------------
 
 

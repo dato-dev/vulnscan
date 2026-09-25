@@ -610,11 +610,12 @@ def test_example_does_not_trust_the_form_state() -> None:
     ).read_text()
     handler = source.split("async def widget_submit")[1].split("@app.")[0]
 
-    # Решение принимается по ответу сканера, а не по состоянию из формы.
+    # Решение принимается по ответу сканера, а не по состоянию из формы:
+    # после запроса вердикта поле состояния не упоминается, а решает общий
+    # `_decide` — тот же, что у формы через библиотеку.
     decisions = handler.split("client.result(vulnscan_scan_id)")[1]
     assert "vulnscan_state" not in decisions, "состояние из формы влияет на решение"
-    assert "outcome.blocked" in decisions
-    assert "outcome.safe" in decisions
+    assert "_decide(client, outcome" in decisions
 
 
 def test_example_distinguishes_blocked_from_unverifiable() -> None:
@@ -628,10 +629,11 @@ def test_example_distinguishes_blocked_from_unverifiable() -> None:
     source = (
         Path(__file__).parent.parent / "examples/feedback-site/feedback_site.py"
     ).read_text()
-    handler = source.split("async def widget_submit")[1].split("@app.")[0]
+    decide = source.split("async def _decide")[1].split("\n\n\n")[0]
 
-    assert "if outcome.blocked" in handler
-    assert "if not outcome.safe" in handler
+    assert "if outcome.blocked" in decide
+    assert "if outcome.unscannable" in decide
+    assert "if not outcome.safe" in decide
 
 
 # --- отложенный результат доводится до конца ------------------------------

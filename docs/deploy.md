@@ -21,7 +21,11 @@ dato1/vulnscantg-notifier    доставка результата, подпис
 dato1/vulnscantg-writer      история проверок в PostgreSQL
 dato1/vulnscantg-cvdmirror   локальное зеркало баз ClamAV
 dato1/vulnscantg-bot         Telegram-бот
+dato1/vulnscantg-feedbackbot бот-форма обратной связи, ставится отдельно от сервиса
 ```
+
+Бот-форма выкатывается не в кластер, а на свой сервер, через свой compose:
+[examples/feedbackbot/README.md](../examples/feedbackbot/README.md).
 
 Демонстрационный сайт (`vulnscantg-demo-site`) собирается отдельно и в
 `make push` не входит: это пример подключения, а не часть сервиса.

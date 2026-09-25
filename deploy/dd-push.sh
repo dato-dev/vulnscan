@@ -127,7 +127,7 @@ DD_SECRETS_ENGAGEMENT=${DD_SECRETS_ENGAGEMENT:-secrets}
 # рабочий ключ в трекер, чтобы потом вычищать его оттуда, — плохой размен.
 DD_GITLEAKS_REDACT=${DD_GITLEAKS_REDACT:-1}
 
-SERVICES_ALL="gateway worker bot notifier writer cvdmirror"
+SERVICES_ALL="gateway worker bot notifier writer cvdmirror feedbackbot"
 TARGETS_DEFAULT="$SERVICES_ALL repo sast secrets"
 
 fail=0

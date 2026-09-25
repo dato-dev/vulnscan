@@ -1,0 +1,96 @@
+# Скрейп метрик для prometheus-operator (M11.14).
+#
+# PodMonitor, а не ServiceMonitor: у воркера, notifier и writer Service нет и
+# не нужно — к ним никто не ходит по сети, кроме Prometheus. Заводить Service
+# ради одного скрейпа значило бы плодить объекты, которые выглядят как точки
+# входа, а ими не являются.
+#
+# ────────────────────────────────────────────────────────────────────────────
+# ИМЯ JOB — ПУБЛИЧНЫЙ КОНТРАКТ, и его здесь выставляют явно.
+#
+# Панели и алерты ищут сервисы по `job=~"vulnscantg.*"`. PodMonitor по
+# умолчанию называет job `<namespace>/<имя монитора>` — `vulnscan/vulnscantg`,
+# что под шаблон НЕ попадает. Ошибки при этом нет никакой: цели в Prometheus
+# есть и зелёные, метрики собираются, а панели пусты — запрос к несуществующей
+# метке возвращает не ошибку, а пустоту.
+#
+# Поэтому job переписывается в те же имена, что в compose
+# (`deploy/lgtp/prometheus/prometheus.yml`), включая то, что worker и deepscan
+# там живут под одним job. Тест сверяет получившиеся имена с compose.
+# ────────────────────────────────────────────────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: vulnscantg
+  namespace: vulnscan
+spec:
+  selector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values:
+          - worker
+          - deepscan
+          - notifier
+          - writer
+          - cvdmirror
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      # Как в стеке compose: интервал входит в `rate()` панелей, и разный
+      # интервал у двух выкатов дал бы разные графики на одних данных.
+      interval: 15s
+      relabelings:
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_app
+          targetLabel: job
+          replacement: vulnscantg-$1
+        # deepscan — тот же образ, что worker, и в compose делит с ним job.
+        # Различаются они по `instance`, а панели считают их вместе.
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_app
+          regex: deepscan
+          targetLabel: job
+          replacement: vulnscantg-worker
+---
+# Gateway — отдельным монитором, а не ещё одним endpoint'ом в общем.
+#
+# Метрики он отдаёт на своём HTTP-порту, а порт с именем `http` есть и у
+# зеркала баз — там раздача файлов, `/metrics` нет. Общий монитор с endpoint'ом
+# `port: http` снимал бы и `cvdmirror:8000/metrics`, получал 404 и держал в
+# Prometheus вечно красную цель — то есть приучал бы не смотреть на красные.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: vulnscantg-gateway
+  namespace: vulnscan
+spec:
+  selector:
+    matchLabels:
+      app: gateway
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 15s
+      relabelings:
+        - targetLabel: job
+          replacement: vulnscantg-gateway
+---
+# Бот живёт в своём namespace, и монитор — там же: PodMonitor видит поды
+# только своего namespace, если не задан `namespaceSelector`.
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: vulnscantg-bot
+  namespace: vulnscan-bot
+spec:
+  selector:
+    matchLabels:
+      app: bot
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      relabelings:
+        - targetLabel: job
+          replacement: vulnscantg-bot

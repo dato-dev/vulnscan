@@ -12,9 +12,13 @@ for extra in (
     ROOT / "packages",
     ROOT / "services" / "gateway",
     ROOT / "services" / "worker",
-    ROOT / "services" / "bot",
+    ROOT / "examples" / "telegram-bot",
     ROOT / "services" / "writer",
     ROOT / "services" / "notifier",
+    ROOT / "examples" / "feedbackbot",
+    # Генераторы синтетических образцов: тесты собирают файлы теми же
+    # функциями, что и `samples/make_samples.py`.
+    ROOT / "samples",
 ):
     sys.path.insert(0, str(extra))
 

@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    # Перезапуск при изменении ConfigMap и Secret, на которые ссылается этот
+    # объект (Stakater Reloader). Нужен он ровно там, где обновление не
+    # доезжает само: секреты, смонтированные через `subPath`, обновлений НЕ
+    # получают вовсе, а переменные окружения читаются один раз при старте.
+    #
+    # ConfigMap с политиками из этого исключён — см. `10-config.yaml`.
+    reloader.stakater.com/auto: "true"
+  name: bot
+  namespace: vulnscan-bot
+  labels:
+    app: bot
+spec:
+  # СТРОГО одна реплика. Опрос идёт с накоплением `offset`: вторая реплика
+  # получит те же обновления и ответит второй раз.
+  replicas: 1
+  strategy:
+    # Recreate, а не RollingUpdate: при обновлении две реплики существуют
+    # одновременно даже при `replicas: 1`, и пользователь получает дубли.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: bot
+  template:
+    metadata:
+      labels:
+        app: bot
+    spec:
+      serviceAccountName: bot
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: bot
+          image: dato1/vulnscantg-bot:latest
+          ports:
+            - name: webhook
+              containerPort: 8090
+            - name: metrics
+              containerPort: 9102
+          envFrom:
+            - configMapRef:
+                name: bot-env
+            - secretRef:
+                name: bot-credentials
+            # Telegram из России напрямую недоступен — вот ради чего прокси и
+            # заводился. `optional`: там, где он не нужен, Secret отсутствует,
+            # и без флага под не стартовал бы вовсе.
+            #
+            # Схема в HTTP_PROXY — http:// ДАЖЕ для HTTPS-трафика: клиент
+            # открывает обычное соединение и просит CONNECT. `https://`
+            # означало бы TLS до самого прокси, чего почти никто не умеет, и
+            # попытка кончится таймаутом.
+            - secretRef:
+                name: bot-proxy
+                optional: true
+          env:
+            - name: IMAGE_TAG
+              value: latest
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            # Бот держит HTTP только ради коллбэков, но живость по нему видно.
+            tcpSocket:
+              port: webhook
+            periodSeconds: 30
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bot
+  namespace: vulnscan-bot
+  labels:
+    app: bot
+spec:
+  selector:
+    app: bot
+  ports:
+    - name: webhook
+      port: 8090
+      targetPort: webhook

@@ -1,0 +1,129 @@
+# Приём файлов. Единственный сервис, доступный снаружи.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    # Перезапуск при изменении ConfigMap и Secret, на которые ссылается этот
+    # объект (Stakater Reloader). Нужен он ровно там, где обновление не
+    # доезжает само: секреты, смонтированные через `subPath`, обновлений НЕ
+    # получают вовсе, а переменные окружения читаются один раз при старте.
+    #
+    # ConfigMap с политиками из этого исключён — см. `10-config.yaml`.
+    reloader.stakater.com/auto: "true"
+  name: gateway
+  namespace: vulnscan
+  labels:
+    app: gateway
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      serviceAccountName: gateway
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # Владелец смонтированных Secret и ConfigMap. Без этого файлы
+        # принадлежат root, а процесс работает под 10001 — и реестр ключей
+        # уходит в degraded, отвечая `503` на каждую загрузку.
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: dato1/vulnscantg-gateway:v1.0.1
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: vulnscan-env
+            - secretRef:
+                name: vulnscan-credentials
+          env:
+            # Чем помечен образ — процессу это знать неоткуда, а вопрос «что
+            # сейчас работает» возникает при каждой аварии. Подставляется
+            # оверлеем вместе с тегом образа.
+            - name: IMAGE_TAG
+              value: latest
+          volumeMounts:
+            - name: policies
+              mountPath: /app/config
+              readOnly: true
+            - name: keys
+              mountPath: /app/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            # ВНИМАНИЕ (M11.11). `/readyz` отдаёт 503, когда базы антивируса
+            # непригодны, — это fail-closed и это правильно для одного
+            # процесса. В Kubernetes это выводит из ротации ВСЕ поды разом, и
+            # сервис перестаёт отвечать вообще, вместо того чтобы отвечать
+            # отказом на проверку.
+            #
+            # Оставлено осознанно: принять файл, который мы не можем проверить,
+            # хуже, чем не принять его. Но решение это, а не умолчание, — и
+            # если оно вам не подходит, менять надо `/readyz` в коде, а не
+            # пробу здесь.
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: policies
+          configMap:
+            name: vulnscan-policies
+            defaultMode: 0444
+        - name: keys
+          secret:
+            secretName: vulnscan-keys
+            # 0444, а не 0400: владелец файла root, процесс под uid 10001.
+            defaultMode: 0444
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: vulnscan
+  labels:
+    app: gateway
+spec:
+  selector:
+    app: gateway
+  ports:
+    # Метрики gateway отдаёт на своём HTTP-порту, отдельного порта нет
+    # (docs/metrics.md). Имя порта важно: на него ссылается HTTPRoute.
+    - name: http
+      port: 8080
+      targetPort: http

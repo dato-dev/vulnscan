@@ -1,0 +1,90 @@
+# Namespace и учётные записи.
+#
+# Своя ServiceAccount каждому сервису, и токен не монтируется НИКОМУ (M11.6).
+# К API кластера не ходит ни один наш сервис, поэтому исключений нет.
+#
+# Токен монтируется по умолчанию, и для процесса, который разбирает враждебные
+# файлы, это значит, что дыра в парсере даёт не «упал контейнер», а учётные
+# данные к API кластера. Та же логика, по которой воркер лишён выхода в сеть.
+#
+# Отдельные учётные записи нужны не ради прав — прав нет ни у кого, — а ради
+# адресуемости: политики Cilium ссылаются на identity, и общий `default`
+# лишает возможности их различать.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vulnscan
+  labels:
+    # Cilium ставит identity по меткам namespace тоже; имя пригодится в
+    # политиках и в Hubble.
+    app.kubernetes.io/part-of: vulnscan
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gateway
+  namespace: vulnscan
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: worker
+  namespace: vulnscan
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deepscan
+  namespace: vulnscan
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: notifier
+  namespace: vulnscan
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: writer
+  namespace: vulnscan
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: redis
+  namespace: vulnscan
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres
+  namespace: vulnscan
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: minio
+  namespace: vulnscan
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: clamd
+  namespace: vulnscan
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cvdmirror
+  namespace: vulnscan
+automountServiceAccountToken: false

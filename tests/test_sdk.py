@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -165,3 +166,124 @@ def test_outcome_is_immutable() -> None:
     )
     with pytest.raises(AttributeError):
         outcome.verdict = "malicious"  # type: ignore[misc]
+
+
+# --- копия вместе с типом ---
+
+
+def test_clean_copy_keeps_type_and_safe_name() -> None:
+    """Тип и имя — из ответа сервиса; путь из заголовка отбрасывается."""
+    import asyncio
+
+    import httpx
+
+    from vulnscan_client import VulnscanClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b"PK\x03\x04",
+            headers={
+                "content-type": "application/zip",
+                "content-disposition": 'attachment; filename="../../etc/abc123.zip"',
+            },
+        )
+
+    async def run():
+        client = VulnscanClient("http://scanner", key_id="k", secret="s" * 32)
+        client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            return await client.download_clean_copy("abc123")
+        finally:
+            await client.close()
+
+    copy = asyncio.run(run())
+
+    assert copy.content == b"PK\x03\x04"
+    assert copy.content_type == "application/zip"
+    assert copy.filename == "abc123.zip"
+
+
+# --- сертификат своего центра ---
+
+
+def test_ca_not_configured_means_system_trust() -> None:
+    """Пусто или /dev/null (необязательное монтирование в compose) — системные центры."""
+    import os
+
+    from vulnscan_client import resolve_ca_file
+
+    assert resolve_ca_file("") is True
+    assert resolve_ca_file(os.devnull) is True
+
+
+def test_readable_ca_file_is_used(tmp_path) -> None:
+    """Настоящий сертификат из системного хранилища — берётся как есть."""
+    import ssl
+
+    from vulnscan_client import resolve_ca_file
+
+    system = ssl.get_default_verify_paths().cafile
+    if not system:
+        pytest.skip("в системе нет файла с центрами сертификации")
+    ca = tmp_path / "ca.crt"
+    ca.write_bytes(Path(system).read_bytes())
+
+    assert resolve_ca_file(str(ca)) == str(ca)
+
+
+def test_not_a_certificate_explains_itself(tmp_path) -> None:
+    """Не тот файл — объяснение, а не SSLError из глубины клиента."""
+    from vulnscan_client import resolve_ca_file
+
+    ca = tmp_path / "ca.crt"
+    ca.write_text("-----BEGIN CERTIFICATE-----\nнеправда\n-----END CERTIFICATE-----\n")
+
+    with pytest.raises(ValueError, match="PEM"):
+        resolve_ca_file(str(ca))
+
+
+@pytest.mark.parametrize(
+    ("setup", "hint"),
+    [
+        ("missing", "не смонтирован"),
+        ("directory", "каталог"),
+        ("empty", "пустой"),
+        ("unreadable", "chmod 644"),
+        ("locked_dir", "не от root"),
+    ],
+)
+def test_bad_ca_explains_itself(tmp_path, setup: str, hint: str) -> None:
+    """Каждая частая причина — своими словами, а не PermissionError из ssl.
+
+    `locked_dir` — случай с боевого: путь внутри /root, а процесс в контейнере
+    работает от uid 10001 и в /root не заходит.
+    """
+    import os
+
+    from vulnscan_client import resolve_ca_file
+
+    if os.getuid() == 0 and setup in ("unreadable", "locked_dir"):
+        pytest.skip("root читает всё, права не проверить")
+    target = tmp_path / "ca.crt"
+    if setup == "directory":
+        target.mkdir()
+    elif setup == "empty":
+        target.write_text("")
+    elif setup == "unreadable":
+        target.write_text("cert")
+        target.chmod(0)
+    elif setup == "locked_dir":
+        locked = tmp_path / "root"
+        locked.mkdir()
+        target = locked / "ca.crt"
+        target.write_text("cert")
+        locked.chmod(0)
+    try:
+        with pytest.raises(ValueError, match=hint):
+            resolve_ca_file(str(target))
+    finally:
+        # Вернуть права, иначе pytest не сможет убрать временный каталог.
+        for path in (tmp_path / "root", target):
+            if path.exists():
+                path.chmod(0o700)

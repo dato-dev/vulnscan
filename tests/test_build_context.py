@@ -14,6 +14,7 @@ from __future__ import annotations
 import fnmatch
 import pathlib
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -214,8 +215,7 @@ def test_pip_is_gone_from_the_repository() -> None:
         calls = [
             line.strip()
             for line in path.read_text().splitlines()
-            if not line.lstrip().startswith("#")
-            and re.search(r"(?<!uv )\bpip install\b", line)
+            if not line.lstrip().startswith("#") and re.search(r"(?<!uv )\bpip install\b", line)
         ]
         if calls:
             offenders[str(path.relative_to(ROOT))] = calls
@@ -250,8 +250,9 @@ def test_uv_version_is_the_same_everywhere() -> None:
     стенде.
     """
     versions = {
-        dockerfile.parent.name: {image.split(":", 1)[1].removesuffix("-alpine")
-                                 for image in _uv_images(dockerfile)}
+        dockerfile.parent.name: {
+            image.split(":", 1)[1].removesuffix("-alpine") for image in _uv_images(dockerfile)
+        }
         for dockerfile in DOCKERFILES
     }
     named = {name: found for name, found in versions.items() if found}
@@ -290,9 +291,7 @@ def test_local_environment_uses_the_lock() -> None:
     recipe = makefile.split("venv:")[1].split("\n\n")[0]
     # Комментарии рецепта — не команды. Без этого тест ловил бы собственное
     # объяснение того, почему запасного пути больше нет.
-    commands = "\n".join(
-        line for line in recipe.splitlines() if not line.strip().startswith("#")
-    )
+    commands = "\n".join(line for line in recipe.splitlines() if not line.strip().startswith("#"))
 
     assert "uv sync --frozen" in commands, "окружение собирается не из лока"
     assert "||" not in commands, "запасной путь ставит не то, что в локе, и делает это молча"
@@ -317,9 +316,7 @@ def _groups() -> dict[str, list[str]]:
     import tomllib
 
     raw = tomllib.loads((ROOT / "pyproject.toml").read_text())["dependency-groups"]
-    return {
-        name: [item for item in items if isinstance(item, str)] for name, items in raw.items()
-    }
+    return {name: [item for item in items if isinstance(item, str)] for name, items in raw.items()}
 
 
 def _declared_groups() -> set[str]:
@@ -367,8 +364,12 @@ def test_every_group_belongs_to_some_image() -> None:
     """Группа без образа — мёртвый список, который продолжают править.
 
     Кроме `dev`: он собирает локальное окружение и в образы не едет намеренно.
+    Группу может ставить и конвейер, а не образ (`docs` — сайт документации):
+    это тоже живое использование.
     """
     used = {group for dockerfile in DOCKERFILES for group in _groups_of(dockerfile)}
+    for workflow in (ROOT / ".github/workflows").glob("*.yml"):
+        used |= set(re.findall(r"--group[ =]([\w-]+)", workflow.read_text()))
     orphans = _declared_groups() - used - {"dev"}
 
     assert not orphans, f"группа не ставится ни одним образом: {sorted(orphans)}"
@@ -512,3 +513,290 @@ def test_stand_config_is_readable_by_the_service_user() -> None:
     }
 
     assert not unreadable, f"сервис не сможет прочитать конфигурацию стенда: {unreadable}"
+
+
+# --- конвейер проверок безопасности ----------------------------------------
+
+SECURITY_WORKFLOW = ROOT / ".github/workflows/security.yml"
+IMAGES_WORKFLOW = ROOT / ".github/workflows/images.yml"
+
+
+def _security_triggers() -> dict:
+    import yaml
+
+    loaded = yaml.safe_load(SECURITY_WORKFLOW.read_text())
+    # `on` в YAML 1.1 — булево, и safe_load превращает ключ в True.
+    return loaded.get("on") or loaded[True]
+
+
+def test_security_runs_on_every_push_to_main() -> None:
+    """Проверки идут на каждый коммит в основную ветку, а не только по неделям.
+
+    Еженедельный прогон означает, что утечка секрета живёт в репозитории в
+    среднем три с половиной дня, прежде чем о ней узнают. За это время её
+    успевают склонировать, а ключ — использовать.
+    """
+    triggers = _security_triggers()
+
+    assert "push" in triggers, "security.yml не запускается на push"
+    assert triggers["push"]["branches"] == ["main"]
+
+
+def test_the_secret_hunt_looks_at_the_whole_repository() -> None:
+    """У push-триггера нет фильтра по путям — и не должно появиться.
+
+    Соблазн понятный: не гонять проверку на правку README. Но секрет попадает
+    в репозиторий каким угодно файлом — примером конфигурации, вставкой в
+    документацию, дампом в комментарии. Список путей означал бы, что утечку
+    ищут только там, где её и так не ждут, и отказ был бы молчаливым: прогон
+    зелёный, потому что не запускался.
+    """
+    push = _security_triggers()["push"]
+
+    assert "paths" not in push and "paths-ignore" not in push, (
+        "фильтр по путям в security.yml: gitleaks перестанет видеть часть репозитория"
+    )
+
+
+def test_images_are_scanned_on_a_schedule_not_on_push() -> None:
+    """Образы проверяются по расписанию, а не на коммит.
+
+    Образ собирается отдельно от коммита: на push его ещё нет, а лежащий в
+    реестре под `latest` собран из другого кода. Прогон по нему давал бы
+    находки, не относящиеся к отправленному изменению, — то есть приучал бы к
+    красному, которое ничего не значит.
+
+    И наоборот: уязвимость в базовом образе появляется без единого коммита,
+    поэтому расписание здесь обязательно.
+    """
+    import yaml
+
+    loaded = yaml.safe_load(IMAGES_WORKFLOW.read_text())
+    triggers = loaded.get("on") or loaded[True]
+
+    assert "push" not in triggers, "образы не имеет смысла проверять на каждый коммит"
+    assert "schedule" in triggers
+
+
+def test_the_common_pipeline_is_pinned() -> None:
+    """Вызов общего пайплайна указывает версию, а не ветку.
+
+    `@main` означал бы, что набор проверок и пороги меняются у нас без нашего
+    участия — в том числе в сторону «стало пропускать». Тег мажорной версии
+    двигается, но в пределах совместимости, как принято у actions.
+    """
+    import yaml
+
+    job = yaml.safe_load(SECURITY_WORKFLOW.read_text())["jobs"]["security"]
+    ref = job["uses"].rsplit("@", 1)[1]
+
+    assert ref != "main", "общий пайплайн подключён по ветке"
+    assert re.fullmatch(r"v\d+(\.\d+)*|[0-9a-f]{40}", ref), f"непонятная версия: {ref}"
+
+
+def test_images_keep_their_own_defectdojo_targets() -> None:
+    """Шесть образов перечислены явно, а не выводятся из умолчания скрипта.
+
+    `dd-push.sh` без аргументов идёт по ВСЕМ целям, включая исходники и SAST, —
+    а их теперь проверяет общий пайплайн. Молчаливое совпадение двух списков
+    означало бы двойную заливку в один и тот же engagement DefectDojo, где
+    `reimport` одного закрывает находки другого.
+    """
+    import yaml
+
+    steps = yaml.safe_load(IMAGES_WORKFLOW.read_text())["jobs"]["scan"]["steps"]
+    targets = next(s["env"]["TARGETS"] for s in steps if "TARGETS" in s.get("env", {}))
+
+    services = re.search(r'SERVICES_ALL="([^"]+)"', (ROOT / "deploy/dd-push.sh").read_text())
+
+    assert services, "список сервисов в dd-push.sh изменил форму"
+    assert services.group(1) in targets, f"состав образов разошёлся со скриптом: {targets}"
+    for source_target in ("repo", "sast", "secrets"):
+        assert f"'{source_target}" not in targets and f" {source_target} " not in targets, (
+            f"«{source_target}» проверяется и здесь, и в общем пайплайне"
+        )
+
+
+# --- версия сборки ---------------------------------------------------------
+
+
+def test_the_version_is_the_same_in_all_three_places() -> None:
+    """Версия объявлена трижды, и расходятся эти объявления молча.
+
+    `pyproject.toml` — источник для установленного пакета. `vscommon.__version__`
+    — то, что видит код. Запасное значение в `version.py` — то, что читает
+    ОБРАЗ: пакет в нём не устанавливается, метаданных нет, и берётся именно оно.
+
+    Поэтому забытая строчка выглядит так: локально всё говорит `1.0.0`, а
+    выкаченный сервис до конца жизни пишет в лог старую версию. Вопрос «какая
+    версия сейчас работает» возникает ровно тогда, когда что-то сломалось, и
+    неверный ответ на него стоит часа поисков не в том коде.
+    """
+    import tomllib
+
+    declared = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+
+    init = (ROOT / "packages/vscommon/__init__.py").read_text()
+    in_init = re.search(r'__version__ = "([^"]+)"', init)
+
+    # Из текста, а не из импорта: в тестовом окружении пакет установлен, и
+    # `VERSION` придёт из метаданных — то есть запасное значение проверено не
+    # будет, хотя именно оно и уезжает в образ.
+    source = (ROOT / "packages/vscommon/version.py").read_text()
+    fallback = re.search(r'VERSION = "([^"]+)"', source)
+
+    assert in_init and fallback, "объявление версии изменило форму — проверка ослепла"
+    assert in_init.group(1) == declared, "vscommon.__version__ разошёлся с pyproject.toml"
+    assert fallback.group(1) == declared, (
+        "запасное значение в version.py разошлось с pyproject.toml — "
+        "образ будет писать в лог старую версию"
+    )
+
+
+# --- откуда берутся образы -------------------------------------------------
+
+GONE_FROM_DOCKER_HUB = ("minio/minio", "minio/mc")
+"""Образы, которых на Docker Hub больше нет.
+
+`minio/minio` и `minio/mc` удалены целиком — api хаба отвечает 404, и это не
+отказ в доступе и не лимит частоты. Официальный источник теперь quay.io.
+
+Ловушка в том, что ссылка на удалённый образ не ломает ничего, пока он лежит в
+кэше машины: боевой сервер работает, конвейер зелёный. Обнаруживается это на
+первой машине с пустым кэшем — то есть на новом сервере или в новом кластере,
+в самый неудачный момент.
+"""
+
+
+def _image_lines() -> dict[str, list[str]]:
+    watched = [
+        ROOT / "deploy/docker-compose.yml",
+        ROOT / "tests/e2e/docker-compose.yml",
+        *sorted((ROOT / "deploy/k8s").rglob("*.yaml")),
+    ]
+    found = {}
+    for path in watched:
+        lines = [
+            line.strip()
+            for line in path.read_text().splitlines()
+            if not line.lstrip().startswith("#") and re.search(r"^\s*-?\s*image:", line)
+        ]
+        if lines:
+            found[str(path.relative_to(ROOT))] = lines
+    return found
+
+
+def test_no_image_comes_from_a_deleted_repository() -> None:
+    """Ни один манифест не ссылается на образ, которого больше нет."""
+    offenders = {}
+    for where, lines in _image_lines().items():
+        bad = [
+            line
+            for line in lines
+            for gone in GONE_FROM_DOCKER_HUB
+            if re.search(rf"image:\s*{re.escape(gone)}[:@]", line)
+        ]
+        if bad:
+            offenders[where] = bad
+
+    assert not offenders, f"образ удалён из Docker Hub: {offenders}"
+
+
+def test_stateful_images_are_pinned() -> None:
+    """У хранилищ состояния тег конкретный, а не плавающий.
+
+    `latest` под данными означает, что мажорная версия хранилища меняется
+    сама, в момент, который выбрали не мы, — например при пересоздании пода
+    ночью. Для наших сервисов плавающий тег допустим: их состояние снаружи.
+    """
+    stateful = ("minio", "postgres", "redis", "clamav")
+    offenders = {}
+
+    for where, lines in _image_lines().items():
+        bad = [
+            line
+            for line in lines
+            if line.endswith(":latest") and any(name in line for name in stateful)
+        ]
+        if bad:
+            offenders[where] = bad
+
+    assert not offenders, f"хранилище состояния на плавающем теге: {offenders}"
+
+
+def test_the_makefile_calls_files_that_exist() -> None:
+    """Цели Makefile ссылаются на существующие скрипты.
+
+    Поймано на живом прогоне: `make test-e2e` звал `configure_sink.py`, хотя
+    файл давно переименован в `configure_stand.py`. Не всплывало это потому,
+    что конвейер зовёт скрипт напрямую, а через `make` его никто не запускал —
+    та же история, что с `corpus/check.py`, пролежавшим сломанным от D1 до M7.1.
+    """
+    text = (ROOT / "Makefile").read_text()
+    called = re.findall(r"\$\(PY\)\s+([\w./-]+\.py)", text)
+
+    missing = sorted({path for path in called if not (ROOT / path).is_file()})
+
+    assert called, "вызовы скриптов из Makefile перестали находиться — проверка ослепла"
+    assert not missing, f"Makefile зовёт несуществующие файлы: {missing}"
+
+
+MUST_REACH_A_CLONE = (
+    "deploy/k8s/base/secrets.example.yaml",
+    "deploy/k8s/bot/secrets.example.yaml",
+    "deploy/.env.example",
+    "deploy/proxy.env.example",
+)
+"""Файлы, без которых свежий клон неполон.
+
+Правила в `.gitignore` намеренно широкие: перечислять пути по одному — способ
+однажды завести секрет в новом месте и закоммитить его. Цена широты в том, что
+под правило попадает и ПРИМЕР: `secrets.example.yaml` содержит «secret» в
+имени, и шаблон, на который ссылаются README и тест, до клона не доезжал.
+
+Обнаруживается это далеко от причины — файл есть локально, в CI его нет. Ровно
+так упал первый прогон сквозного стенда.
+"""
+
+
+@pytest.mark.skipif(not (ROOT / ".git").exists(), reason="нужен git-репозиторий")
+@pytest.mark.parametrize("relative", MUST_REACH_A_CLONE)
+def test_examples_are_not_swallowed_by_gitignore(relative: str) -> None:
+    """Пример не должен исчезать вместе с секретом, который он показывает."""
+    path = ROOT / relative
+    assert path.is_file(), f"{relative}: файла нет вовсе"
+
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", relative],
+        cwd=ROOT,
+        capture_output=True,
+        check=False,
+    )
+
+    assert ignored.returncode != 0, (
+        f"{relative} игнорируется .gitignore — в свежем клоне его не будет"
+    )
+
+
+def test_the_config_helper_checks_before_it_uploads() -> None:
+    """Скрипт заливки конфигурации сначала проверяет, потом применяет.
+
+    `kubectl create configmap --from-file` принимает что угодно. Битый JSON
+    уезжает в кластер молча, сервис не падает — пишет ERROR и работает на
+    значениях по умолчанию. То есть файлы проверяются по чужим порогам, копии
+    не выгружаются, а `kubectl get pods` показывает зелёное.
+
+    Ровно это и произошло: незакрытая скобка в `policies.json` пролежала в
+    ConfigMap, gateway каждые полминуты писал «файл политик не читается», а
+    причину искали в notifier.
+    """
+    script = (ROOT / "deploy/k8s/config.sh").read_text()
+    # Только исполняемые строки: слово `kubectl` встречается и в пояснении,
+    # почему обёртка вообще нужна, — сравнивать надо не с ним.
+    code = [line for line in script.splitlines() if not line.lstrip().startswith("#")]
+
+    check = next(i for i, line in enumerate(code) if "build_policy(" in line)
+    upload = next(i for i, line in enumerate(code) if line.startswith("kubectl"))
+
+    assert check < upload, "конфигурация заливается раньше, чем проверяется"
+    assert "set -eu" in script, "без -e падение проверки не остановит заливку"

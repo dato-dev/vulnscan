@@ -11,6 +11,8 @@ from typing import Any
 from vscommon.models import Finding, ScanFacts, ScanJob
 from vscommon.weights import WeightTable
 
+from ..archive import Member, UnpackBudget
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,6 +40,16 @@ class ScanContext:
     такой документ читается и проверяется как обычный."""
 
     supported: bool = True
+
+    budget: UnpackBudget | None = None
+    """Бюджет распаковки всего дерева (M6.1). Один объект на загруженный файл:
+    вложение получает бюджет контейнера, а не новый."""
+
+    depth: int = 0
+    """Уровень вложенности: корень — ноль."""
+
+    members: list[Member] = field(default_factory=list)
+    """Что распаковать и проверить после стадий. Заполняет разбор архива."""
 
     def add(
         self,
@@ -67,6 +79,27 @@ class ScanContext:
                 detail=detail,
             )
         )
+
+    def adopt(self, child: ScanContext, label: str) -> None:
+        """Признаки вложения становятся признаками контейнера (M6.2).
+
+        Без этого архив с вредоносным PDF внутри получал бы `clean`: сам
+        архив ничем не плох, плохо его содержимое. Переносится всё, что
+        влияет на вердикт, — и признаки, и то, что проверить не удалось:
+        непроверенное вложение делает непроверенным весь архив.
+
+        Балл признака не пересчитывается — вложение считалось той же
+        таблицей весов. Повторный код не удваивается, как и у одного файла:
+        десять одинаковых документов в архиве — не десятикратная улика.
+        """
+        for finding in child.findings:
+            if any(own.code == finding.code for own in self.findings):
+                continue
+            detail = f"{label}: {finding.detail}" if finding.detail else label
+            self.findings.append(finding.model_copy(update={"detail": detail}))
+        self.failed_stages |= child.failed_stages
+        self.encrypted = self.encrypted or child.encrypted
+        self.supported = self.supported and child.supported
 
     def facts(self) -> ScanFacts:
         """Срез, которого достаточно для вердикта и для кэша."""

@@ -5,16 +5,31 @@ from __future__ import annotations
 import logging
 
 from .base import ScanContext, Stage
-from .filetype_detect import HEAD_BYTES, TypeDetector
+from .filetype_detect import (
+    APK_MIME,
+    DOCX_MIMES,
+    HEAD_BYTES,
+    JAR_MIME,
+    ZIP_MIME,
+    TypeDetector,
+    refine_zip,
+)
 
 logger = logging.getLogger(__name__)
 
 SUPPORTED_MIMES = frozenset(
-    {"application/pdf", "image/jpeg", "image/png", "image/gif", "image/tiff"}
+    {"application/pdf", "image/jpeg", "image/png", "image/gif", "image/tiff", ZIP_MIME} | DOCX_MIMES
 )
 
 EXECUTABLE_MIMES = frozenset(
-    {"application/x-dosexec", "application/x-elf", "application/x-mach-binary"}
+    {
+        "application/x-dosexec",
+        "application/x-elf",
+        "application/x-mach-binary",
+        # Исполняемые, хоть и выглядят архивом: запускаются одним щелчком.
+        JAR_MIME,
+        APK_MIME,
+    }
 )
 
 # Расширения, которые в потоке документов не встречаются легитимно.
@@ -79,25 +94,31 @@ class FiletypeStage(Stage):
             head = handle.read(HEAD_BYTES)
 
         detected = self._detector.detect(head)
-        ctx.detected_mime = detected.mime
-        ctx.detected_ext = detected.ext
+        mime, ext = detected.mime, detected.ext
+        if mime == ZIP_MIME:
+            # Сигнатура одна на DOCX, JAR и обычный архив. Конфликт с libmagic
+            # считается по сигнатуре, до уточнения: libmagic называет DOCX
+            # то архивом, то документом, и оба ответа верны.
+            mime, ext = refine_zip(ctx.path)
+        ctx.detected_mime = mime
+        ctx.detected_ext = ext
         ctx.engines["filetype"] = {
-            "mime": detected.mime,
+            "mime": mime,
             "libmagic": detected.libmagic_mime,
             "offset": detected.offset,
         }
 
-        if detected.mime is None:
+        if mime is None:
             ctx.supported = False
             ctx.add(self.name, "TYPE_UNKNOWN", detected.libmagic_mime or "тип не распознан")
             return
 
-        if detected.mime not in SUPPORTED_MIMES:
+        if mime not in SUPPORTED_MIMES:
             ctx.supported = False
-            ctx.add(self.name, "TYPE_UNSUPPORTED", detected.mime)
+            ctx.add(self.name, "TYPE_UNSUPPORTED", mime)
 
-        if detected.mime in EXECUTABLE_MIMES:
-            ctx.add(self.name, "TYPE_EXECUTABLE", detected.mime)
+        if mime in EXECUTABLE_MIMES:
+            ctx.add(self.name, "TYPE_EXECUTABLE", mime)
 
         if detected.offset > 0:
             # Файл открывается просмотрщиком, но обходит наивную проверку
@@ -111,11 +132,11 @@ class FiletypeStage(Stage):
                 f"таблица: {detected.mime}, libmagic: {detected.libmagic_mime}",
             )
 
-        self._check_declared(ctx, detected.mime)
-        self._check_extension(ctx, detected.ext)
-        self._check_polyglot(ctx, detected.mime)
+        self._check_declared(ctx, mime)
+        self._check_extension(ctx, ext)
+        self._check_polyglot(ctx, mime)
 
-        logger.debug("тип определён", extra={"stage": self.name, "mime": detected.mime})
+        logger.debug("тип определён", extra={"stage": self.name, "mime": mime})
 
     def _check_declared(self, ctx: ScanContext, mime: str) -> None:
         declared = (ctx.job.declared_mime or "").split(";")[0].strip().lower()

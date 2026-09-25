@@ -35,7 +35,7 @@
 скоринга — **серверная политика тенанта**, а не параметры запроса. Клиент не может
 полем в теле отключить себе fail-closed. Присланные поля вида `on_timeout` молча
 игнорируются. Настройка политики — через `POLICY_FILE`, пример:
-[policies.example.json](../policies.example.json).
+[policies.example.json](../deploy/config/policies.example.json).
 
 **Коды ответа:**
 
