@@ -33,6 +33,8 @@ RUN uv export --frozen --no-default-groups --group bot --group telemetry \
     && rm /tmp/requirements.txt
 
 COPY packages/vscommon /app/vscommon
+# Из клиентской библиотеки — только проверка сертификата своего центра.
+COPY packages/vulnscan_client /app/vulnscan_client
 COPY examples/telegram-bot/botapp /app/botapp
 
 RUN useradd --uid 10001 --no-create-home --shell /usr/sbin/nologin vulnscan

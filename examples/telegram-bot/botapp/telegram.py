@@ -25,7 +25,13 @@ class TelegramError(RuntimeError):
 
 class TelegramClient:
     def __init__(self) -> None:
-        self._http = httpx.AsyncClient(timeout=settings.poll_timeout_s + 10)
+        # Явный прокси — только для Telegram, и тогда окружение не читается.
+        # Без него — как прежде: `HTTPS_PROXY` из окружения, если задан.
+        self._http = httpx.AsyncClient(
+            timeout=settings.poll_timeout_s + 10,
+            proxy=settings.telegram_proxy or None,
+            trust_env=not settings.telegram_proxy,
+        )
         self._base = f"{settings.telegram_api}/bot{settings.telegram_token}"
         self._file_base = f"{settings.telegram_api}/file/bot{settings.telegram_token}"
 

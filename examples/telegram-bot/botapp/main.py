@@ -15,6 +15,7 @@ from vscommon.logging import log_context, setup_logging
 from vscommon.metrics import metrics, setup_metrics
 from vscommon.metrics import serve as serve_metrics
 from vscommon.telemetry import setup_tracing, shutdown_tracing, span
+from vulnscan_client import resolve_ca_file
 
 from . import wording
 from .config import settings
@@ -308,7 +309,14 @@ async def amain() -> None:
     if settings.metrics_enabled:
         serve_metrics(settings.metrics_port)
     if not settings.telegram_token:
-        logger.error("TELEGRAM_BOT_TOKEN не задан — бот не запускается")
+        logger.error("TELEGRAM_TOKEN не задан — бот не запускается")
+        return
+    try:
+        resolve_ca_file(settings.scanner_ca_file)
+    except ValueError as exc:
+        # Одной строкой и до запуска: иначе это PermissionError из глубины
+        # ssl, где не сказано ни какой файл, ни чего не хватает.
+        logger.error("сертификат своего центра не годится", extra={"reason": str(exc)})
         return
 
     bot = Bot()

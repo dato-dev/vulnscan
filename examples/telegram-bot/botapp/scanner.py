@@ -23,6 +23,7 @@ from vscommon.signing import (
     sign,
 )
 from vscommon.telemetry import current_traceparent
+from vulnscan_client import resolve_ca_file
 
 from .config import settings
 
@@ -98,7 +99,14 @@ class CircuitBreaker:
 
 class ScannerClient:
     def __init__(self) -> None:
-        self._http = httpx.AsyncClient(timeout=settings.request_timeout_s)
+        # `trust_env=False`: прокси из окружения стоит ради Telegram, и запросы
+        # к сканеру с подписью ушли бы через него. В Kubernetes это прикрывал
+        # `NO_PROXY`; на отдельном сервере прикрыть было бы нечем.
+        self._http = httpx.AsyncClient(
+            timeout=settings.request_timeout_s,
+            verify=resolve_ca_file(settings.scanner_ca_file),
+            trust_env=False,
+        )
         self._breaker = CircuitBreaker()
 
     async def close(self) -> None:

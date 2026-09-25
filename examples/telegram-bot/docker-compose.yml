@@ -1,0 +1,64 @@
+# Telegram-бот на отдельном сервере.
+#
+# Сканер здесь не поднимается: он в Kubernetes, бот ходит к нему по HTTPS
+# через Gateway API. Входящих портов нет: обновления Telegram забираются
+# long polling, вердикт — опросом сканера. Вебхук для коллбэков сканера не
+# поднимается — до бота на отдельном сервере сканеру не достучаться.
+#
+#   cp .env.example .env   # заполнить
+#   docker compose up -d
+#   docker compose logs -f
+
+name: telegram-bot
+
+services:
+  bot:
+    # Тег — явно, а не `latest`: иначе на сервере работает то, что было
+    # последним на момент первого `pull`, а не то, что вы собрали сейчас.
+    image: ${IMAGE_NAMESPACE:-dato1}/vulnscantg-bot:${IMAGE_TAG:?задайте IMAGE_TAG в .env — явный тег, а не latest}
+    restart: unless-stopped
+    env_file:
+      - .env
+      # Совместимость с прежним выкатом: HTTPS_PROXY отсюда действует только на
+      # Telegram — к сканеру бот через прокси не ходит. Новое место для прокси —
+      # TELEGRAM_PROXY в .env. Файла может не быть.
+      - path: proxy.env
+        required: false
+    environment:
+      # Чем помечен образ — процессу это знать неоткуда, а вопрос «что сейчас
+      # работает» возникает при каждой аварии.
+      IMAGE_TAG: ${IMAGE_TAG}
+      SCANNER_URL: ${SCANNER_URL:?задайте SCANNER_URL в .env}
+      # Пусто — только опрос. Адрес вида http://bot:8090 из общего compose
+      # здесь не работает: сканер в кластере такого имени не знает.
+      WEBHOOK_URL: ""
+      # Путь фиксирован и совпадает с точкой монтирования ниже.
+      SCANNER_CA_FILE: /etc/telegram-bot/ca.crt
+      METRICS_PORT: "9102"
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+
+    volumes:
+      # Сертификат своего центра, если TLS на входе в кластер выпущен не
+      # публичным. Не задан — сюда монтируется /dev/null, и бот доверяет
+      # системным центрам.
+      - ${SCANNER_CA_FILE_ON_HOST:-/dev/null}:/etc/telegram-bot/ca.crt:ro
+
+    ports:
+      # Метрики — только на localhost по умолчанию. Если Prometheus ходит сюда
+      # с другой машины, задайте METRICS_BIND адресом внутренней сети.
+      - "${METRICS_BIND:-127.0.0.1}:9102:9102"
+
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Файл держится в памяти целиком до ответа сканера; Bot API отдаёт до 20 МБ.
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
